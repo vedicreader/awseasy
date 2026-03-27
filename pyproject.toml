@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "awseasy"
+dynamic = ["version"]
+description = "AWS cloud provisioning for GenAI workloads with enterprise compliance (HIPAA, ISO 27001, SOC 2)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "vedicreader"}]
+keywords = ["aws", "bedrock", "genai", "llm", "hipaa", "iso27001", "cloud", "devops"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "fastcore>=1.5.29",
+    "boto3>=1.34",
+    "botocore>=1.34",
+]
+
+[project.urls]
+Repository = "https://github.com/vedicreader/awseasy"
+Documentation = "https://vedicreader.github.io/awseasy/"
+
+[project.entry-points.nbdev]
+awseasy = "awseasy._modidx:d"
+
+[tool.hatch.version]
+path = "awseasy/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["awseasy"]
+
+[tool.nbdev]
+
+[dependency-groups]
+dev = ["nbdev>=3.0.12"]

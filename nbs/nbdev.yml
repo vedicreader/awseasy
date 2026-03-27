@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "awseasy"
+  site-url: "https://vedicreader.github.io/awseasy"
+  description: "AWS cloud provisioning for GenAI workloads with enterprise compliance"
+  repo-branch: main
+  repo-url: "https://github.com/vedicreader/awseasy"
