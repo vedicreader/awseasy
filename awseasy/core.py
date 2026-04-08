@@ -6,30 +6,34 @@
 __all__ = ['HIPAA', 'ISO27001', 'SOC2', 'AWSAuth', 'resource_group', 'list_resource_groups', 'delete_resource_group',
            'GenAIStack']
 
-# %% ../nbs/00_core.ipynb #8f755987
+# %% ../nbs/00_core.ipynb #3168d4ef
 import os
 import json
 import boto3
 
-# %% ../nbs/00_core.ipynb #754c6a1c
+# %% ../nbs/00_core.ipynb #efff7c20
 HIPAA = dict(
     encryption=True, tls_min='1.2', audit=True, multi_az=True,
     backup_retention=35, deletion_protection=True,
+    ssl_only=True, public_access=False,
     tags={'compliance': 'hipaa'},
 )
 
 ISO27001 = dict(
     encryption=True, audit=True, managed_role=True,
     least_privilege=True, tls_min='1.2',
+    ssl_only=True, access_logging=True,
     tags={'compliance': 'iso27001'},
 )
 
 SOC2 = dict(
     encryption=True, audit=True, mfa_required=True, backup_retention=7,
+    cloudtrail=True, guardduty=True, vpc_flow_logs=True,
     tags={'compliance': 'soc2'},
 )
 
-# %% ../nbs/00_core.ipynb #b8df9a9c
+
+# %% ../nbs/00_core.ipynb #dc797f23
 class AWSAuth:
     'boto3.Session with credential chain. Reads AWS_DEFAULT_REGION from env.'
     def __init__(self, region=None, profile=None, role_arn=None):
@@ -47,7 +51,7 @@ class AWSAuth:
         self.region = self.session.region_name
         self.account_id = self.session.client('sts').get_caller_identity()['Account']
 
-# %% ../nbs/00_core.ipynb #dda5ff27
+# %% ../nbs/00_core.ipynb #22057ff3
 def _rg_client(auth):
     return auth.session.client('resource-groups')
 
@@ -79,7 +83,7 @@ def delete_resource_group(auth, name):
     'Delete a resource group (does not delete underlying resources).'
     _rg_client(auth).delete_group(GroupName=name)
 
-# %% ../nbs/00_core.ipynb #ccc0de2f
+# %% ../nbs/00_core.ipynb #0e4d93ba
 class GenAIStack:
     'Provision a full enterprise GenAI stack on AWS in one call.'
     def __init__(self, auth, name, compliance=None):
@@ -88,12 +92,15 @@ class GenAIStack:
         self._resources = {}
 
     def provision(self, bedrock=True, opensearch=True, s3=True, dynamodb=True,
-                  redis=True, eks=False, secrets_manager=True) -> dict:
+                  redis=True, eks=False, secrets_manager=True,
+                  security_baseline=False) -> dict:
         'Create all resources, wire IAM roles, store secrets in Secrets Manager.'
         from .network import create_role, attach_policy, create_secret
         from .ai import create_opensearch, create_kb
         from .data import create_bucket, create_table, create_redis
         from .compute import create_eks
+        from .security import (enable_cloudtrail, enable_guardduty, enable_config,
+                                enable_security_hub, set_iam_password_policy)
 
         c = self.compliance
         name = self.name
@@ -134,6 +141,19 @@ class GenAIStack:
         if eks:
             self._resources['eks'] = create_eks(auth, f'{name}-eks', **c)
 
+        if security_baseline:
+            log_bucket = f'{name}-{auth.account_id}-logs'
+            create_bucket(auth, log_bucket)
+            log_role = create_role(auth, f'{name}-config-role',
+                                   service='config.amazonaws.com')
+            attach_policy(auth, f'{name}-config-role',
+                          'arn:aws:iam::aws:policy/service-role/AWS_ConfigRole')
+            enable_cloudtrail(auth, f'{name}-trail', log_bucket)
+            enable_guardduty(auth)
+            enable_config(auth, log_bucket, log_role['Role']['Arn'])
+            enable_security_hub(auth)
+            set_iam_password_policy(auth)
+
         return self._resources
 
     def summary(self) -> dict:
@@ -157,7 +177,7 @@ def _resource_id(v):
                     'ReplicationGroupId', 'ClusterName', 'ARN', 'Arn',
                     'BucketName', 'Name', 'name'):
             if key in v: return v[key]
-        # nested
         for key in ('Role', 'Group', 'Secret'):
             if key in v: return v[key].get('Arn', str(v))
     return str(v)
+

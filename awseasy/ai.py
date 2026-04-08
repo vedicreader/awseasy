@@ -6,10 +6,10 @@
 __all__ = ['list_bedrock_models', 'invoke_model', 'create_kb', 'kb_data_source', 'create_opensearch', 'opensearch_endpoint',
            'opensearch_admin_creds']
 
-# %% ../nbs/01_ai.ipynb #0e526c2e
+# %% ../nbs/01_ai.ipynb #0865e96a
 import json
 
-# %% ../nbs/01_ai.ipynb #3436234b
+# %% ../nbs/01_ai.ipynb #4dbbb5b9
 def _bedrock_client(auth):
     return auth.session.client('bedrock')
 
@@ -26,22 +26,42 @@ def list_bedrock_models(auth) -> list:
 
 def invoke_model(auth, prompt, model_id='anthropic.claude-3-5-sonnet-20241022-v2:0',
                  max_tokens=1024, **_) -> str:
-    'Invoke a Bedrock foundation model. Returns text response.'
-    body = json.dumps({
-        'anthropic_version': 'bedrock-2023-05-31',
-        'max_tokens': max_tokens,
-        'messages': [{'role': 'user', 'content': prompt}],
-    })
+    'Invoke a Bedrock foundation model. Returns text response. Supports Anthropic, Amazon, Meta, Mistral, Cohere.'
+    provider = model_id.split('.')[0]
+    if provider == 'anthropic':
+        body = json.dumps({
+            'anthropic_version': 'bedrock-2023-05-31',
+            'max_tokens': max_tokens,
+            'messages': [{'role': 'user', 'content': prompt}],
+        })
+    elif provider == 'amazon':
+        body = json.dumps({'inputText': prompt,
+                           'textGenerationConfig': {'maxTokenCount': max_tokens}})
+    elif provider == 'meta':
+        body = json.dumps({'prompt': prompt, 'max_gen_len': max_tokens})
+    elif provider == 'mistral':
+        body = json.dumps({'prompt': prompt, 'max_tokens': max_tokens})
+    elif provider == 'cohere':
+        body = json.dumps({'prompt': prompt, 'max_tokens': max_tokens})
+    else:
+        body = json.dumps({'inputText': prompt})
     resp = _bedrock_runtime(auth).invoke_model(
         modelId=model_id, body=body, contentType='application/json')
-    return json.loads(resp['body'].read())['content'][0]['text']
+    data = json.loads(resp['body'].read())
+    # Normalise response shape across providers
+    if provider == 'anthropic': return data['content'][0]['text']
+    if provider == 'amazon':    return data.get('results', [{}])[0].get('outputText', str(data))
+    if provider == 'meta':      return data.get('generation', str(data))
+    if provider == 'mistral':   return data.get('outputs', [{}])[0].get('text', str(data))
+    if provider == 'cohere':    return data.get('generations', [{}])[0].get('text', str(data))
+    return str(data)
 
-# %% ../nbs/01_ai.ipynb #5d93aae4
+
+# %% ../nbs/01_ai.ipynb #92d71cde
 def create_kb(auth, name, bucket, role_arn,
               embed_model='amazon.titan-embed-text-v2:0', **_) -> dict:
     'Create a Bedrock Knowledge Base backed by S3 + OpenSearch for RAG.'
     client = _bedrock_agent_client(auth)
-    os_endpoint = f'https://{name}-search.{auth.region}.es.amazonaws.com'
     kb = client.create_knowledge_base(
         name=name,
         roleArn=role_arn,
@@ -66,13 +86,11 @@ def create_kb(auth, name, bucket, role_arn,
             },
         },
     )['knowledgeBase']
-    # attach S3 data source
     kb_data_source(auth, kb['knowledgeBaseId'], bucket)
     return kb
 
 def kb_data_source(auth, kb_id, bucket, prefix='') -> dict:
     'Add an S3 data source to a Bedrock Knowledge Base.'
-    s3_uri = f's3://{bucket}/{prefix}' if prefix else f's3://{bucket}/'
     return _bedrock_agent_client(auth).create_data_source(
         knowledgeBaseId=kb_id,
         name=f'{kb_id}-s3',
@@ -83,16 +101,28 @@ def kb_data_source(auth, kb_id, bucket, prefix='') -> dict:
         },
     )['dataSource']
 
-# %% ../nbs/01_ai.ipynb #c335d337
+
+# %% ../nbs/01_ai.ipynb #6676cad3
 def _os_client(auth):
     return auth.session.client('opensearch')
 
 def create_opensearch(auth, name, engine_version='OpenSearch_2.13',
                       instance_type='r6g.large.search', instance_count=1,
                       encryption=True, tags=None, **_) -> dict:
-    'Create or update an OpenSearch domain with encryption-at-rest enabled.'
+    'Create or update an OpenSearch domain with encryption-at-rest and no anonymous access.'
     client = _os_client(auth)
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
+    # Deny anonymous (unauthenticated) access by default
+    access_policy = json.dumps({
+        'Version': '2012-10-17',
+        'Statement': [{
+            'Effect': 'Deny',
+            'Principal': {'AWS': '*'},
+            'Action': 'es:*',
+            'Resource': f'arn:aws:es:{auth.region}:{auth.account_id}:domain/{name}/*',
+            'Condition': {'StringEquals': {'aws:PrincipalType': 'Anonymous'}},
+        }],
+    })
     kwargs = dict(
         DomainName=name,
         EngineVersion=engine_version,
@@ -102,7 +132,9 @@ def create_opensearch(auth, name, engine_version='OpenSearch_2.13',
         },
         EncryptionAtRestOptions={'Enabled': encryption},
         NodeToNodeEncryptionOptions={'Enabled': True},
-        DomainEndpointOptions={'EnforceHTTPS': True, 'TLSSecurityPolicy': 'Policy-Min-TLS-1-2-2019-07'},
+        DomainEndpointOptions={'EnforceHTTPS': True,
+                               'TLSSecurityPolicy': 'Policy-Min-TLS-1-2-2019-07'},
+        AccessPolicies=access_policy,
         TagList=tag_list,
     )
     try:
@@ -111,11 +143,15 @@ def create_opensearch(auth, name, engine_version='OpenSearch_2.13',
         return client.describe_domain(DomainName=name)['DomainStatus']
 
 def opensearch_endpoint(auth, name) -> str:
-    'Return the OpenSearch domain endpoint URL.'
+    'Return the OpenSearch domain endpoint URL. Returns None if domain is not yet active.'
     domain = _os_client(auth).describe_domain(DomainName=name)['DomainStatus']
-    return f'https://{domain["Endpoint"]}'
+    endpoint = domain.get('Endpoint')
+    if not endpoint:
+        return None
+    return f'https://{endpoint}'
 
 def opensearch_admin_creds(auth, name) -> dict:
     'Return master user credentials stored in Secrets Manager for the domain.'
     from .network import get_secret
     return json.loads(get_secret(auth, f'opensearch/{name}/admin'))
+

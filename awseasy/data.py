@@ -6,15 +6,18 @@
 __all__ = ['create_bucket', 'bucket_url', 'presigned_url', 'bucket_conn', 'create_table', 'table_resource', 'dynamo_conn',
            'create_postgres', 'postgres_conn', 'create_redis', 'redis_conn']
 
-# %% ../nbs/02_data.ipynb #223ecd3a
+# %% ../nbs/02_data.ipynb #64c9dc83
 import secrets as _secrets_mod
 
-# %% ../nbs/02_data.ipynb #4c71fcee
+# %% ../nbs/02_data.ipynb #533d5fab
+_tags = lambda d: [{'Key': k, 'Value': v} for k, v in (d or {}).items()]
+
 def _s3(auth):
     return auth.session.client('s3')
 
-def create_bucket(auth, name, versioning=True, tags=None, **compliance_opts) -> dict:
-    'Create S3 bucket. Blocks public access, enables SSE-S3 encryption by default.'
+def create_bucket(auth, name, versioning=True, ssl_only=False,
+                  access_logging=None, tags=None, **compliance_opts) -> dict:
+    'Create S3 bucket. Blocks public access, enables SSE-S3 encryption. ssl_only=True adds a deny-HTTP bucket policy.'
     s3 = _s3(auth)
     kwargs = {'Bucket': name}
     if auth.region != 'us-east-1':
@@ -23,14 +26,12 @@ def create_bucket(auth, name, versioning=True, tags=None, **compliance_opts) -> 
         s3.create_bucket(**kwargs)
     except s3.exceptions.BucketAlreadyOwnedByYou:
         pass
-    # Block all public access
     s3.put_public_access_block(
         Bucket=name,
         PublicAccessBlockConfiguration={
             'BlockPublicAcls': True, 'IgnorePublicAcls': True,
             'BlockPublicPolicy': True, 'RestrictPublicBuckets': True,
         })
-    # Encryption
     s3.put_bucket_encryption(
         Bucket=name,
         ServerSideEncryptionConfiguration={
@@ -39,10 +40,30 @@ def create_bucket(auth, name, versioning=True, tags=None, **compliance_opts) -> 
     if versioning:
         s3.put_bucket_versioning(
             Bucket=name, VersioningConfiguration={'Status': 'Enabled'})
+    if ssl_only or compliance_opts.get('ssl_only'):
+        import json as _json
+        s3.put_bucket_policy(Bucket=name, Policy=_json.dumps({
+            'Version': '2012-10-17',
+            'Statement': [{
+                'Sid': 'DenyNonTLS',
+                'Effect': 'Deny',
+                'Principal': '*',
+                'Action': 's3:*',
+                'Resource': [f'arn:aws:s3:::{name}', f'arn:aws:s3:::{name}/*'],
+                'Condition': {'Bool': {'aws:SecureTransport': 'false'}},
+            }],
+        }))
+    if access_logging or compliance_opts.get('access_logging'):
+        log_bucket = access_logging if isinstance(access_logging, str) else f'{name}-logs'
+        s3.put_bucket_logging(
+            Bucket=name,
+            BucketLoggingStatus={
+                'LoggingEnabled': {'TargetBucket': log_bucket,
+                                   'TargetPrefix': f'{name}/'}})
     if tags:
         s3.put_bucket_tagging(
             Bucket=name,
-            Tagging={'TagSet': [{'Key': k, 'Value': v} for k, v in tags.items()]})
+            Tagging={'TagSet': _tags(tags)})
     return {'BucketName': name, 'Region': auth.region}
 
 def bucket_url(name, key) -> str:
@@ -59,7 +80,8 @@ def bucket_conn(name) -> str:
     'Return the bucket name (use with boto3 resource/client directly).'
     return name
 
-# %% ../nbs/02_data.ipynb #6076afc9
+
+# %% ../nbs/02_data.ipynb #74cfa135
 def _dynamo(auth):
     return auth.session.client('dynamodb')
 
@@ -72,18 +94,16 @@ def create_table(auth, name, partition_key, sort_key=None,
     if sort_key:
         key_schema.append({'AttributeName': sort_key, 'KeyType': 'RANGE'})
         attr_defs.append({'AttributeName': sort_key, 'AttributeType': 'S'})
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     try:
         resp = client.create_table(
             TableName=name,
             KeySchema=key_schema,
             AttributeDefinitions=attr_defs,
             BillingMode=billing_mode,
-            Tags=tag_list,
+            Tags=_tags(tags),
         )['TableDescription']
     except client.exceptions.ResourceInUseException:
         resp = client.describe_table(TableName=name)['Table']
-    # Enable PITR
     client.update_continuous_backups(
         TableName=name,
         PointInTimeRecoverySpecification={'PointInTimeRecoveryEnabled': True})
@@ -97,7 +117,8 @@ def dynamo_conn(auth, name) -> str:
     'Return the table name (use with boto3 DynamoDB client/resource directly).'
     return name
 
-# %% ../nbs/02_data.ipynb #e06b1fc0
+
+# %% ../nbs/02_data.ipynb #ab1fcce7
 def _rds(auth):
     return auth.session.client('rds')
 
@@ -105,12 +126,14 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
                     master_username='pgadmin', master_password=None,
                     multi_az=False, deletion_protection=False,
                     tags=None, **compliance_opts) -> dict:
-    'Create RDS PostgreSQL instance with encryption-at-rest enabled.'
+    'Create RDS PostgreSQL. Encryption-at-rest, PubliclyAccessible=False. Auto-stores generated password in Secrets Manager at rds/{name}/master on first creation.'
+    import json as _json
+    from .network import create_secret
     client = _rds(auth)
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     password = master_password or _secrets_mod.token_urlsafe(24)
+    created_new = False
     try:
-        return client.create_db_instance(
+        resp = client.create_db_instance(
             DBInstanceIdentifier=name,
             DBInstanceClass=instance_class,
             Engine='postgres',
@@ -119,17 +142,25 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
             MasterUserPassword=password,
             MultiAZ=multi_az,
             StorageEncrypted=True,
-            DeletionProtection=deletion_protection,
+            PubliclyAccessible=False,
+            DeletionProtection=deletion_protection or compliance_opts.get('deletion_protection', False),
             AllocatedStorage=20,
             BackupRetentionPeriod=compliance_opts.get('backup_retention', 7),
-            Tags=tag_list,
+            CACertificateIdentifier='rds-ca-rsa2048-g1',
+            Tags=_tags(tags),
         )['DBInstance']
+        created_new = True
     except client.exceptions.DBInstanceAlreadyExistsFault:
-        return client.describe_db_instances(
+        resp = client.describe_db_instances(
             DBInstanceIdentifier=name)['DBInstances'][0]
+    # Store generated password in Secrets Manager on first creation
+    if created_new and not master_password:
+        create_secret(auth, f'rds/{name}/master',
+                      _json.dumps({'username': master_username, 'password': password}))
+    return resp
 
 def postgres_conn(auth, name, db='postgres') -> str:
-    'Return a postgresql:// connection string (password not included — use Secrets Manager).'
+    'Return a postgresql:// connection string (password not included — use Secrets Manager at rds/{name}/master).'
     inst = _rds(auth).describe_db_instances(
         DBInstanceIdentifier=name)['DBInstances'][0]
     host = inst['Endpoint']['Address']
@@ -137,34 +168,43 @@ def postgres_conn(auth, name, db='postgres') -> str:
     user = inst['MasterUsername']
     return f'postgresql://{user}@{host}:{port}/{db}'
 
-# %% ../nbs/02_data.ipynb #449200e2
+
+# %% ../nbs/02_data.ipynb #4d4eb310
 def _elasticache(auth):
     return auth.session.client('elasticache')
 
 def create_redis(auth, name, node_type='cache.t3.micro', num_shards=1,
-                 tags=None, **compliance_opts) -> dict:
-    'Create ElastiCache Redis OSS cluster with in-transit encryption.'
+                 auth_token=False, tags=None, **compliance_opts) -> dict:
+    'Create ElastiCache Redis OSS cluster. TLS + at-rest encryption. auth_token=True generates and stores AUTH token in Secrets Manager.'
+    from .network import create_secret
     client = _elasticache(auth)
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
+    kwargs = dict(
+        ReplicationGroupId=name,
+        ReplicationGroupDescription=name,
+        CacheNodeType=node_type,
+        Engine='redis',
+        NumNodeGroups=num_shards,
+        ReplicasPerNodeGroup=0,
+        TransitEncryptionEnabled=True,
+        AtRestEncryptionEnabled=True,
+        Tags=_tags(tags),
+    )
+    if num_shards > 1:
+        kwargs['AutomaticFailoverEnabled'] = True
+    if auth_token:
+        token = _secrets_mod.token_urlsafe(32)
+        kwargs['AuthToken'] = token
+        create_secret(auth, f'elasticache/{name}/auth', token)
     try:
-        return client.create_replication_group(
-            ReplicationGroupId=name,
-            ReplicationGroupDescription=name,
-            CacheNodeType=node_type,
-            Engine='redis',
-            NumNodeGroups=num_shards,
-            ReplicasPerNodeGroup=0,
-            TransitEncryptionEnabled=True,
-            AtRestEncryptionEnabled=True,
-            Tags=tag_list,
-        )['ReplicationGroup']
+        return client.create_replication_group(**kwargs)['ReplicationGroup']
     except client.exceptions.ReplicationGroupAlreadyExistsFault:
         return client.describe_replication_groups(
             ReplicationGroupId=name)['ReplicationGroups'][0]
 
 def redis_conn(auth, name) -> str:
-    'Return the redis:// connection string for the primary endpoint.'
+    'Return the rediss:// connection string for the primary endpoint.'
     rg = _elasticache(auth).describe_replication_groups(
         ReplicationGroupId=name)['ReplicationGroups'][0]
     ep = rg['NodeGroups'][0]['PrimaryEndpoint']
     return f'rediss://{ep["Address"]}:{ep["Port"]}'
+

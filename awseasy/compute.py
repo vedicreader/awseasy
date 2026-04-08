@@ -6,7 +6,9 @@
 __all__ = ['create_instance', 'instance_ip', 'start_instance', 'stop_instance', 'terminate_instance', 'create_eks',
            'eks_kubeconfig', 'scale_eks', 'create_ecr', 'ecr_login_url', 'attach_ecr_to_eks']
 
-# %% ../nbs/03_compute.ipynb #e02aa56d
+# %% ../nbs/03_compute.ipynb #c1a02f15
+_tags = lambda d: [{'Key': k, 'Value': v} for k, v in (d or {}).items()]
+
 def _ec2(auth):
     return auth.session.client('ec2')
 
@@ -18,25 +20,26 @@ _UBUNTU_FILTER = [
 ]
 
 def _latest_ubuntu_ami(auth) -> str:
+    from fastcore.basics import first
     images = _ec2(auth).describe_images(
         Filters=_UBUNTU_FILTER, Owners=['099720109477'])['Images']
-    return sorted(images, key=lambda x: x['CreationDate'], reverse=True)[0]['ImageId']
+    return first(sorted(images, key=lambda x: x['CreationDate'], reverse=True))['ImageId']
 
 def create_instance(auth, name, instance_type='t3.medium', ami=None, key_name=None,
                     subnet_id=None, sg_ids=None, iam_instance_profile=None,
-                    tags=None, **compliance_opts) -> dict:
-    'Launch EC2 instance with IMDSv2 enforced and optional instance profile.'
+                    termination_protection=False, tags=None, **compliance_opts) -> dict:
+    'Launch EC2 instance with IMDSv2 enforced. termination_protection=True prevents accidental deletion.'
     ec2 = _ec2(auth)
     image_id = ami or _latest_ubuntu_ami(auth)
     tag_specs = [{'ResourceType': 'instance',
-                  'Tags': [{'Key': 'Name', 'Value': name}] +
-                          [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]}]
+                  'Tags': [{'Key': 'Name', 'Value': name}] + _tags(tags)}]
     kwargs = dict(
         ImageId=image_id,
         InstanceType=instance_type,
         MinCount=1, MaxCount=1,
         MetadataOptions={'HttpTokens': 'required',  # IMDSv2
                          'HttpPutResponseHopLimit': 1},
+        DisableApiTermination=termination_protection,
         TagSpecifications=tag_specs,
     )
     if key_name:  kwargs['KeyName'] = key_name
@@ -47,9 +50,10 @@ def create_instance(auth, name, instance_type='t3.medium', ami=None, key_name=No
     return ec2.run_instances(**kwargs)['Instances'][0]
 
 def instance_ip(auth, instance_id) -> str:
-    'Return the public IP address of an EC2 instance.'
-    inst = _ec2(auth).describe_instances(
-        InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]
+    'Return the public IP address of an EC2 instance (falls back to private IP).'
+    from fastcore.basics import first
+    inst = first(_ec2(auth).describe_instances(
+        InstanceIds=[instance_id])['Reservations'])['Instances'][0]
     return inst.get('PublicIpAddress', inst.get('PrivateIpAddress', ''))
 
 def start_instance(auth, instance_id):
@@ -64,27 +68,27 @@ def terminate_instance(auth, instance_id):
     'Terminate (permanently delete) an EC2 instance.'
     _ec2(auth).terminate_instances(InstanceIds=[instance_id])
 
-# %% ../nbs/03_compute.ipynb #d3423855
-import subprocess
+
+# %% ../nbs/03_compute.ipynb #32090fa8
+import base64, yaml
 
 def _eks(auth):
     return auth.session.client('eks')
 
 def create_eks(auth, name, node_type='m5.large', node_count=3,
                version='1.31', subnet_ids=None, sg_ids=None,
-               tags=None, **compliance_opts) -> dict:
-    'Create EKS cluster with managed node group.'
+               logging_types=None, endpoint_public_access=True,
+               endpoint_private_access=False, tags=None, **compliance_opts) -> dict:
+    'Create EKS cluster with managed node group and control-plane logging.'
     from .network import create_role, attach_policy
     client = _eks(auth)
 
-    # Cluster IAM role
     cluster_role = create_role(
         auth, f'{name}-eks-cluster-role',
         trust_policy=_eks_cluster_trust())
     attach_policy(auth, f'{name}-eks-cluster-role',
                   'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy')
 
-    # Node group IAM role
     node_role = create_role(
         auth, f'{name}-eks-node-role',
         trust_policy=_ec2_trust())
@@ -94,44 +98,65 @@ def create_eks(auth, name, node_type='m5.large', node_count=3,
         attach_policy(auth, f'{name}-eks-node-role',
                       f'arn:aws:iam::aws:policy/{policy}')
 
-    resources_vpc = {}
+    resources_vpc = {'endpointPublicAccess': endpoint_public_access,
+                     'endpointPrivateAccess': endpoint_private_access}
     if subnet_ids: resources_vpc['subnetIds'] = subnet_ids
     if sg_ids:     resources_vpc['securityGroupIds'] = sg_ids
 
+    log_types = logging_types or ['api', 'audit', 'authenticator']
+    tag_dict = {t['Key']: t['Value'] for t in _tags(tags)} if tags else {}
     try:
         cluster = client.create_cluster(
             name=name,
             version=version,
             roleArn=cluster_role['Role']['Arn'],
             resourcesVpcConfig=resources_vpc,
-            tags=tags or {},
+            logging={'clusterLogging': [{'types': log_types, 'enabled': True}]},
+            tags=tag_dict,
         )['cluster']
     except client.exceptions.ResourceInUseException:
         cluster = client.describe_cluster(name=name)['cluster']
 
-    # Managed node group
-    try:
-        client.create_nodegroup(
-            clusterName=name,
-            nodegroupName=f'{name}-ng',
-            scalingConfig={'minSize': 1, 'maxSize': node_count * 2,
-                           'desiredSize': node_count},
-            instanceTypes=[node_type],
-            nodeRole=node_role['Role']['Arn'],
-            subnets=subnet_ids or [],
-        )
-    except client.exceptions.ResourceInUseException:
-        pass
+    if subnet_ids:
+        try:
+            client.create_nodegroup(
+                clusterName=name,
+                nodegroupName=f'{name}-ng',
+                scalingConfig={'minSize': 1, 'maxSize': node_count * 2,
+                               'desiredSize': node_count},
+                instanceTypes=[node_type],
+                nodeRole=node_role['Role']['Arn'],
+                subnets=subnet_ids,
+            )
+        except client.exceptions.ResourceInUseException:
+            pass
 
     return cluster
 
 def eks_kubeconfig(auth, name) -> str:
-    'Generate and return kubeconfig for an EKS cluster (requires aws CLI).'
-    result = subprocess.run(
-        ['aws', 'eks', 'update-kubeconfig', '--name', name,
-         '--region', auth.region, '--dry-run'],
-        capture_output=True, text=True)
-    return result.stdout
+    'Build and return kubeconfig YAML for an EKS cluster using boto3 (no CLI required).'
+    cluster = _eks(auth).describe_cluster(name=name)['cluster']
+    endpoint = cluster['endpoint']
+    ca_data = cluster['certificateAuthority']['data']
+    cluster_arn = cluster['arn']
+    kubeconfig = {
+        'apiVersion': 'v1',
+        'kind': 'Config',
+        'clusters': [{'name': cluster_arn,
+                      'cluster': {'server': endpoint,
+                                  'certificate-authority-data': ca_data}}],
+        'contexts': [{'name': cluster_arn,
+                      'context': {'cluster': cluster_arn, 'user': cluster_arn}}],
+        'current-context': cluster_arn,
+        'users': [{'name': cluster_arn,
+                   'user': {'exec': {
+                       'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                       'command': 'aws',
+                       'args': ['eks', 'get-token', '--cluster-name', name,
+                                '--region', auth.region],
+                   }}}],
+    }
+    return yaml.dump(kubeconfig, default_flow_style=False)
 
 def scale_eks(auth, name, node_count):
     'Update desired node count on the default node group.'
@@ -152,24 +177,39 @@ def _ec2_trust() -> dict:
         'Principal': {'Service': 'ec2.amazonaws.com'},
         'Action': 'sts:AssumeRole'}]}
 
-# %% ../nbs/03_compute.ipynb #9ac02904
+
+# %% ../nbs/03_compute.ipynb #dd9ce8b3
 def _ecr(auth):
     return auth.session.client('ecr')
 
-def create_ecr(auth, name, scan_on_push=True, tags=None) -> dict:
-    'Create ECR repository with scan-on-push enabled.'
+def create_ecr(auth, name, scan_on_push=True, lifecycle_policy=True, tags=None) -> dict:
+    'Create ECR repository with scan-on-push. lifecycle_policy=True removes untagged images after 30 days.'
+    import json as _json
     client = _ecr(auth)
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     try:
-        return client.create_repository(
+        repo = client.create_repository(
             repositoryName=name,
             imageScanningConfiguration={'scanOnPush': scan_on_push},
             encryptionConfiguration={'encryptionType': 'AES256'},
-            tags=tag_list,
+            tags=_tags(tags),
         )['repository']
     except client.exceptions.RepositoryAlreadyExistsException:
-        return client.describe_repositories(
-            repositoryNames=[name])['repositories'][0]
+        repo = client.describe_repositories(repositoryNames=[name])['repositories'][0]
+    if lifecycle_policy:
+        client.put_lifecycle_policy(
+            repositoryName=name,
+            lifecyclePolicyText=_json.dumps({
+                'rules': [{
+                    'rulePriority': 1,
+                    'description': 'Remove untagged images after 30 days',
+                    'selection': {'tagStatus': 'untagged',
+                                  'countType': 'sinceImagePushed',
+                                  'countUnit': 'days', 'countNumber': 30},
+                    'action': {'type': 'expire'},
+                }],
+            }),
+        )
+    return repo
 
 def ecr_login_url(auth, name) -> str:
     'Return the ECR repository URI (host/name for docker push/pull).'
@@ -180,3 +220,4 @@ def attach_ecr_to_eks(auth, ecr_name, eks_name):
     from .network import attach_policy
     attach_policy(auth, f'{eks_name}-eks-node-role',
                   'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly')
+

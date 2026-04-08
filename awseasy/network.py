@@ -7,18 +7,23 @@ __all__ = ['create_vpc', 'add_subnet', 'create_security_group', 'sg_rule', 'crea
            'secret_arn', 'create_role', 'attach_policy', 'role_arn', 'create_vpc_endpoint', 'create_distribution',
            'create_alb']
 
-# %% ../nbs/04_network.ipynb #85008cc1
+# %% ../nbs/04_network.ipynb #ad80639e
 import json
 
-# %% ../nbs/04_network.ipynb #c1f133b9
+# %% ../nbs/04_network.ipynb #38d056fc
+_tags = lambda d: [{'Key': k, 'Value': v} for k, v in (d or {}).items()]
+
 def _ec2(auth):
     return auth.session.client('ec2')
 
 def create_vpc(auth, name, cidr='10.0.0.0/16', tags=None) -> dict:
-    'Create a VPC with DNS resolution and hostnames enabled.'
+    'Create a VPC with DNS resolution and hostnames enabled. Idempotent — returns existing VPC if Name tag matches.'
     ec2 = _ec2(auth)
-    tag_list = [{'Key': 'Name', 'Value': name}] + [
-        {'Key': k, 'Value': v} for k, v in (tags or {}).items()]
+    existing = ec2.describe_vpcs(
+        Filters=[{'Name': 'tag:Name', 'Values': [name]}])['Vpcs']
+    if existing:
+        return existing[0]
+    tag_list = [{'Key': 'Name', 'Value': name}] + _tags(tags)
     vpc = ec2.create_vpc(
         CidrBlock=cidr,
         TagSpecifications=[{'ResourceType': 'vpc', 'Tags': tag_list}],
@@ -30,8 +35,13 @@ def create_vpc(auth, name, cidr='10.0.0.0/16', tags=None) -> dict:
     return vpc
 
 def add_subnet(auth, vpc_id, cidr, az, public=False, name=None) -> dict:
-    'Add a subnet to a VPC. Set public=True to map public IPs on launch.'
+    'Add a subnet to a VPC. Idempotent — returns existing subnet if CIDR+VPC matches.'
     ec2 = _ec2(auth)
+    existing = ec2.describe_subnets(
+        Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]},
+                 {'Name': 'cidrBlock', 'Values': [cidr]}])['Subnets']
+    if existing:
+        return existing[0]
     tags = [{'Key': 'Name', 'Value': name or cidr}]
     subnet = ec2.create_subnet(
         VpcId=vpc_id, CidrBlock=cidr, AvailabilityZone=az,
@@ -44,36 +54,48 @@ def add_subnet(auth, vpc_id, cidr, az, public=False, name=None) -> dict:
     return subnet
 
 def create_security_group(auth, name, vpc_id, description='', tags=None) -> dict:
-    'Create a security group in a VPC.'
+    'Create a security group in a VPC. Idempotent — returns existing group if name+VPC matches.'
     ec2 = _ec2(auth)
-    tag_list = [{'Key': 'Name', 'Value': name}] + [
-        {'Key': k, 'Value': v} for k, v in (tags or {}).items()]
-    sg = ec2.create_security_group(
-        GroupName=name, Description=description or name, VpcId=vpc_id,
-        TagSpecifications=[{'ResourceType': 'security-group', 'Tags': tag_list}],
-    )
-    return ec2.describe_security_groups(GroupIds=[sg['GroupId']])['SecurityGroups'][0]
+    try:
+        sg = ec2.create_security_group(
+            GroupName=name, Description=description or name, VpcId=vpc_id,
+            TagSpecifications=[{'ResourceType': 'security-group',
+                                'Tags': [{'Key': 'Name', 'Value': name}] + _tags(tags)}],
+        )
+        return ec2.describe_security_groups(
+            GroupIds=[sg['GroupId']])['SecurityGroups'][0]
+    except ec2.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidGroup.Duplicate':
+            from fastcore.basics import first
+            return first(ec2.describe_security_groups(
+                Filters=[{'Name': 'group-name', 'Values': [name]},
+                         {'Name': 'vpc-id', 'Values': [vpc_id]}])['SecurityGroups'])
+        raise
 
 def sg_rule(auth, sg_id, direction, protocol, port, cidr='0.0.0.0/0'):
-    'Add an inbound or outbound rule to a security group.'
+    'Add an inbound or outbound rule to a security group. Idempotent — silently ignores duplicate rules.'
     ec2 = _ec2(auth)
     rule = [{'IpProtocol': protocol,
               'FromPort': port, 'ToPort': port,
               'IpRanges': [{'CidrIp': cidr}]}]
-    if direction == 'ingress':
-        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=rule)
-    else:
-        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=rule)
+    try:
+        if direction == 'ingress':
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=rule)
+        else:
+            ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=rule)
+    except ec2.exceptions.ClientError as e:
+        if e.response['Error']['Code'] != 'InvalidPermission.Duplicate':
+            raise
 
-# %% ../nbs/04_network.ipynb #a91c1552
+
+# %% ../nbs/04_network.ipynb #216e5175
 def _sm(auth):
     return auth.session.client('secretsmanager')
 
 def create_secret(auth, name, value, kms_key_id=None, tags=None, **_) -> dict:
     'Create or update a Secrets Manager secret. KMS-encrypted when kms_key_id provided.'
     client = _sm(auth)
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
-    kwargs = {'Name': name, 'SecretString': value, 'Tags': tag_list}
+    kwargs = {'Name': name, 'SecretString': value, 'Tags': _tags(tags)}
     if kms_key_id: kwargs['KmsKeyId'] = kms_key_id
     try:
         return client.create_secret(**kwargs)
@@ -93,24 +115,24 @@ def secret_arn(auth, name) -> str:
     'Return the ARN of a secret.'
     return _sm(auth).describe_secret(SecretId=name)['ARN']
 
-# %% ../nbs/04_network.ipynb #b09f937e
+
+# %% ../nbs/04_network.ipynb #36c40747
 def _iam(auth):
     return auth.session.client('iam')
 
 def create_role(auth, name, service=None, trust_policy=None, tags=None) -> dict:
-    'Create an IAM role. Provide service (e.g. "ec2.amazonaws.com") or a full trust_policy dict.'
+    'Create an IAM role. Provide service (e.g. "ec2.amazonaws.com") or a full trust_policy dict. Idempotent.'
     client = _iam(auth)
     if trust_policy is None:
         trust_policy = {'Version': '2012-10-17', 'Statement': [{
             'Effect': 'Allow',
             'Principal': {'Service': service},
             'Action': 'sts:AssumeRole'}]}
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     try:
         return client.create_role(
             RoleName=name,
             AssumeRolePolicyDocument=json.dumps(trust_policy),
-            Tags=tag_list,
+            Tags=_tags(tags),
         )
     except client.exceptions.EntityAlreadyExistsException:
         return {'Role': client.get_role(RoleName=name)['Role']}
@@ -123,7 +145,8 @@ def role_arn(auth, role_name) -> str:
     'Return the ARN of an IAM role.'
     return _iam(auth).get_role(RoleName=role_name)['Role']['Arn']
 
-# %% ../nbs/04_network.ipynb #74bd4d86
+
+# %% ../nbs/04_network.ipynb #ed0349c1
 def create_vpc_endpoint(auth, vpc_id, service_name, endpoint_type='Interface',
                         subnet_ids=None, sg_ids=None) -> dict:
     'Create a VPC Endpoint (Interface or Gateway) for an AWS service.'
@@ -138,7 +161,7 @@ def create_vpc_endpoint(auth, vpc_id, service_name, endpoint_type='Interface',
         kwargs['PrivateDnsEnabled'] = True
     return _ec2(auth).create_vpc_endpoint(**kwargs)['VpcEndpoint']
 
-# %% ../nbs/04_network.ipynb #00a51469
+# %% ../nbs/04_network.ipynb #f801b890
 import time
 
 def _cf(auth):
@@ -149,10 +172,18 @@ def _elbv2(auth):
 
 def create_distribution(auth, name, origin_domain, waf_acl_arn=None,
                         tags=None) -> dict:
-    'Create a CloudFront distribution with optional AWS WAF web ACL.'
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
+    'Create a CloudFront distribution with HTTPS-only origin and TLS 1.2. Idempotent — checks for existing distribution by Comment before creating.'
+    from fastcore.basics import first
+    cf = _cf(auth)
+    # Check for existing distribution with this name
+    dists = cf.list_distributions()['DistributionList'].get('Items', [])
+    existing = first((d for d in dists if d.get('Comment') == name), None)
+    if existing:
+        return existing
+
+    tag_list = _tags(tags)
     dist_config = {
-        'CallerReference': f'{name}-{int(time.time())}',
+        'CallerReference': f'awseasy-{name}',
         'Comment': name,
         'Enabled': True,
         'Origins': {'Quantity': 1, 'Items': [{
@@ -176,27 +207,31 @@ def create_distribution(auth, name, origin_domain, waf_acl_arn=None,
     }
     if waf_acl_arn:
         dist_config['WebACLId'] = waf_acl_arn
-    resp = _cf(auth).create_distribution_with_tags(
+    return cf.create_distribution_with_tags(
         DistributionConfigWithTags={
             'DistributionConfig': dist_config,
             'Tags': {'Items': tag_list},
         })['Distribution']
-    return resp
 
 def create_alb(auth, name, vpc_id, subnet_ids, scheme='internet-facing',
                waf_acl_arn=None, tags=None) -> dict:
-    'Create an Application Load Balancer with optional AWS WAF v2 web ACL.'
+    'Create an Application Load Balancer. Idempotent — returns existing ALB if name matches.'
+    from fastcore.basics import first
     client = _elbv2(auth)
-    tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
-    alb = client.create_load_balancer(
-        Name=name,
-        Subnets=subnet_ids,
-        Scheme=scheme,
-        Type='application',
-        IpAddressType='ipv4',
-        Tags=tag_list,
-    )['LoadBalancers'][0]
+    try:
+        alb = client.create_load_balancer(
+            Name=name,
+            Subnets=subnet_ids,
+            Scheme=scheme,
+            Type='application',
+            IpAddressType='ipv4',
+            Tags=_tags(tags),
+        )['LoadBalancers'][0]
+    except client.exceptions.DuplicateLoadBalancerNameException:
+        alb = first(client.describe_load_balancers(
+            Names=[name])['LoadBalancers'])
     if waf_acl_arn:
         auth.session.client('wafv2').associate_web_acl(
             WebACLArn=waf_acl_arn, ResourceArn=alb['LoadBalancerArn'])
     return alb
+
