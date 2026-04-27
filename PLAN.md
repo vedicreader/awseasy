@@ -231,16 +231,34 @@ __all__ = ['create_vpc', 'add_subnet', 'create_security_group', 'sg_rule',
 8. ✅ **`nbs/index.ipynb`** — README + usage examples
 9. ✅ **`nbdev-export`** — generate all `.py` files
 10. ✅ **`PLAN.md`** + **`README.md`** — documentation
+11. ✅ **Bug fix pass** — idempotency, Converse API, password persistence, AOSS, multi_az, role normalization
+12. ✅ **Tooling** — Ruff, pytest+moto, CI/CD workflows, `uv.lock`
+
+---
+
+## Unimplemented compliance flag notes (future work)
+
+The following flags exist in compliance dict profiles but have no enforcement yet:
+
+| Flag | Profile | Status | Notes |
+|---|---|---|---|
+| `mfa_required` | `SOC2` | Future | Would need MFA condition on IAM trust policies. Implemented via `aws:MultiFactorAuthPresent` condition in `create_role()`. |
+| `least_privilege` | `ISO27001` | Future | Currently all roles use `AmazonBedrockFullAccess` and similar broad policies. Real least-privilege requires generating scoped inline policies per resource ARN. |
+| `audit` | `HIPAA`, `ISO27001`, `SOC2` | Future | Would enable CloudTrail + CloudWatch Logs for each provisioned service. |
+
+These flags are accepted via `**compliance_opts` by all `create_*` functions and silently ignored until enforcement is implemented.
 
 ---
 
 ## Verification checklist
 
+- [ ] `python -m pytest tests/` — all tests pass (47 unit tests)
+- [ ] `python -m ruff check awseasy/ tests/` — lint passes
 - [ ] `python -c "from awseasy import *"` succeeds
 - [ ] `python -c "from awseasy.core import HIPAA; print(HIPAA)"` prints profile
 - [ ] With real creds: `AWSAuth()` resolves `region` + `account_id`
 - [ ] `create_bucket(auth, 'test-bucket')` creates encrypted, public-access-blocked bucket
 - [ ] `create_secret(auth, 'test/key', 'val')` stores in Secrets Manager
-- [ ] `invoke_model(auth, 'Hello')` returns response from Claude 3.5 Sonnet
+- [ ] `invoke_model(auth, 'Hello')` returns response from Claude 3.5 Sonnet (Converse API)
 - [ ] `GenAIStack(auth, 'myapp').provision()` provisions full stack
-- [ ] `create_vpc(auth, 'test-vpc')` creates VPC with DNS enabled
+- [ ] `create_vpc(auth, 'test-vpc')` is idempotent — calling twice returns same VPC

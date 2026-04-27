@@ -7,6 +7,7 @@ __all__ = ['create_bucket', 'bucket_url', 'presigned_url', 'bucket_conn', 'creat
            'create_postgres', 'postgres_conn', 'create_redis', 'redis_conn']
 
 # %% ../nbs/02_data.ipynb #223ecd3a
+import json as _json
 import secrets as _secrets_mod
 
 # %% ../nbs/02_data.ipynb #4c71fcee
@@ -105,12 +106,13 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
                     master_username='pgadmin', master_password=None,
                     multi_az=False, deletion_protection=False,
                     tags=None, **compliance_opts) -> dict:
-    'Create RDS PostgreSQL instance with encryption-at-rest enabled.'
+    'Create RDS PostgreSQL instance with encryption-at-rest enabled. Password stored in Secrets Manager.'
+    from .network import create_secret
     client = _rds(auth)
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     password = master_password or _secrets_mod.token_urlsafe(24)
     try:
-        return client.create_db_instance(
+        inst = client.create_db_instance(
             DBInstanceIdentifier=name,
             DBInstanceClass=instance_class,
             Engine='postgres',
@@ -124,9 +126,14 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
             BackupRetentionPeriod=compliance_opts.get('backup_retention', 7),
             Tags=tag_list,
         )['DBInstance']
+        # Persist credentials so callers can retrieve them later
+        create_secret(auth, f'rds/{name}/master',
+                      _json.dumps({'username': master_username, 'password': password}))
+        inst['MasterSecretArn'] = f'rds/{name}/master'
     except client.exceptions.DBInstanceAlreadyExistsFault:
-        return client.describe_db_instances(
+        inst = client.describe_db_instances(
             DBInstanceIdentifier=name)['DBInstances'][0]
+    return inst
 
 def postgres_conn(auth, name, db='postgres') -> str:
     'Return a postgresql:// connection string (password not included — use Secrets Manager).'
@@ -146,6 +153,7 @@ def create_redis(auth, name, node_type='cache.t3.micro', num_shards=1,
     'Create ElastiCache Redis OSS cluster with in-transit encryption.'
     client = _elasticache(auth)
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
+    multi_az = compliance_opts.get('multi_az', False)
     try:
         return client.create_replication_group(
             ReplicationGroupId=name,
@@ -153,7 +161,7 @@ def create_redis(auth, name, node_type='cache.t3.micro', num_shards=1,
             CacheNodeType=node_type,
             Engine='redis',
             NumNodeGroups=num_shards,
-            ReplicasPerNodeGroup=0,
+            ReplicasPerNodeGroup=1 if multi_az else 0,
             TransitEncryptionEnabled=True,
             AtRestEncryptionEnabled=True,
             Tags=tag_list,

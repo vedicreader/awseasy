@@ -26,6 +26,7 @@ ISO27001 = dict(
 
 SOC2 = dict(
     encryption=True, audit=True, mfa_required=True, backup_retention=7,
+    tls_min='1.2',
     tags={'compliance': 'soc2'},
 )
 

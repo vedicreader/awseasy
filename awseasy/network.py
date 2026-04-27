@@ -11,12 +11,20 @@ __all__ = ['create_vpc', 'add_subnet', 'create_security_group', 'sg_rule', 'crea
 import json
 
 # %% ../nbs/04_network.ipynb #c1f133b9
+from botocore.exceptions import ClientError
+
 def _ec2(auth):
     return auth.session.client('ec2')
 
 def create_vpc(auth, name, cidr='10.0.0.0/16', tags=None) -> dict:
-    'Create a VPC with DNS resolution and hostnames enabled.'
+    'Create a VPC with DNS resolution and hostnames enabled. Idempotent — returns existing VPC if name+CIDR match.'
     ec2 = _ec2(auth)
+    existing = ec2.describe_vpcs(Filters=[
+        {'Name': 'cidr', 'Values': [cidr]},
+        {'Name': 'tag:Name', 'Values': [name]},
+    ])['Vpcs']
+    if existing:
+        return existing[0]
     tag_list = [{'Key': 'Name', 'Value': name}] + [
         {'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     vpc = ec2.create_vpc(
@@ -30,8 +38,14 @@ def create_vpc(auth, name, cidr='10.0.0.0/16', tags=None) -> dict:
     return vpc
 
 def add_subnet(auth, vpc_id, cidr, az, public=False, name=None) -> dict:
-    'Add a subnet to a VPC. Set public=True to map public IPs on launch.'
+    'Add a subnet to a VPC. Idempotent — returns existing subnet if vpc_id+CIDR match.'
     ec2 = _ec2(auth)
+    existing = ec2.describe_subnets(Filters=[
+        {'Name': 'vpc-id', 'Values': [vpc_id]},
+        {'Name': 'cidrBlock', 'Values': [cidr]},
+    ])['Subnets']
+    if existing:
+        return existing[0]
     tags = [{'Key': 'Name', 'Value': name or cidr}]
     subnet = ec2.create_subnet(
         VpcId=vpc_id, CidrBlock=cidr, AvailabilityZone=az,
@@ -44,26 +58,37 @@ def add_subnet(auth, vpc_id, cidr, az, public=False, name=None) -> dict:
     return subnet
 
 def create_security_group(auth, name, vpc_id, description='', tags=None) -> dict:
-    'Create a security group in a VPC.'
+    'Create a security group in a VPC. Idempotent — returns existing group if name+vpc match.'
     ec2 = _ec2(auth)
     tag_list = [{'Key': 'Name', 'Value': name}] + [
         {'Key': k, 'Value': v} for k, v in (tags or {}).items()]
-    sg = ec2.create_security_group(
-        GroupName=name, Description=description or name, VpcId=vpc_id,
-        TagSpecifications=[{'ResourceType': 'security-group', 'Tags': tag_list}],
-    )
-    return ec2.describe_security_groups(GroupIds=[sg['GroupId']])['SecurityGroups'][0]
+    try:
+        sg = ec2.create_security_group(
+            GroupName=name, Description=description or name, VpcId=vpc_id,
+            TagSpecifications=[{'ResourceType': 'security-group', 'Tags': tag_list}],
+        )
+        return ec2.describe_security_groups(GroupIds=[sg['GroupId']])['SecurityGroups'][0]
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidGroup.Duplicate':
+            return ec2.describe_security_groups(
+                Filters=[{'Name': 'group-name', 'Values': [name]},
+                         {'Name': 'vpc-id', 'Values': [vpc_id]}])['SecurityGroups'][0]
+        raise
 
 def sg_rule(auth, sg_id, direction, protocol, port, cidr='0.0.0.0/0'):
-    'Add an inbound or outbound rule to a security group.'
+    'Add an inbound or outbound rule to a security group. Idempotent — silently ignores duplicates.'
     ec2 = _ec2(auth)
     rule = [{'IpProtocol': protocol,
               'FromPort': port, 'ToPort': port,
               'IpRanges': [{'CidrIp': cidr}]}]
-    if direction == 'ingress':
-        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=rule)
-    else:
-        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=rule)
+    try:
+        if direction == 'ingress':
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=rule)
+        else:
+            ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=rule)
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'InvalidPermission.Duplicate':
+            raise
 
 # %% ../nbs/04_network.ipynb #a91c1552
 def _sm(auth):
@@ -107,11 +132,12 @@ def create_role(auth, name, service=None, trust_policy=None, tags=None) -> dict:
             'Action': 'sts:AssumeRole'}]}
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     try:
-        return client.create_role(
+        resp = client.create_role(
             RoleName=name,
             AssumeRolePolicyDocument=json.dumps(trust_policy),
             Tags=tag_list,
         )
+        return {'Role': resp['Role']}
     except client.exceptions.EntityAlreadyExistsException:
         return {'Role': client.get_role(RoleName=name)['Role']}
 
@@ -126,7 +152,15 @@ def role_arn(auth, role_name) -> str:
 # %% ../nbs/04_network.ipynb #74bd4d86
 def create_vpc_endpoint(auth, vpc_id, service_name, endpoint_type='Interface',
                         subnet_ids=None, sg_ids=None) -> dict:
-    'Create a VPC Endpoint (Interface or Gateway) for an AWS service.'
+    'Create a VPC Endpoint (Interface or Gateway) for an AWS service. Idempotent.'
+    ec2 = _ec2(auth)
+    existing = ec2.describe_vpc_endpoints(Filters=[
+        {'Name': 'vpc-id', 'Values': [vpc_id]},
+        {'Name': 'service-name', 'Values': [service_name]},
+        {'Name': 'vpc-endpoint-state', 'Values': ['available', 'pending']},
+    ])['VpcEndpoints']
+    if existing:
+        return existing[0]
     kwargs = dict(
         VpcId=vpc_id,
         ServiceName=service_name,
@@ -136,11 +170,9 @@ def create_vpc_endpoint(auth, vpc_id, service_name, endpoint_type='Interface',
         if subnet_ids: kwargs['SubnetIds'] = subnet_ids
         if sg_ids:     kwargs['SecurityGroupIds'] = sg_ids
         kwargs['PrivateDnsEnabled'] = True
-    return _ec2(auth).create_vpc_endpoint(**kwargs)['VpcEndpoint']
+    return ec2.create_vpc_endpoint(**kwargs)['VpcEndpoint']
 
 # %% ../nbs/04_network.ipynb #00a51469
-import time
-
 def _cf(auth):
     return auth.session.client('cloudfront')
 
@@ -149,10 +181,17 @@ def _elbv2(auth):
 
 def create_distribution(auth, name, origin_domain, waf_acl_arn=None,
                         tags=None) -> dict:
-    'Create a CloudFront distribution with optional AWS WAF web ACL.'
+    'Create a CloudFront distribution with optional AWS WAF web ACL. Idempotent.'
+    cf = _cf(auth)
+    # Check for existing distribution with the same Comment (used as logical name)
+    paginator = cf.get_paginator('list_distributions')
+    for page in paginator.paginate():
+        for dist in page.get('DistributionList', {}).get('Items', []):
+            if dist.get('Comment') == name:
+                return dist
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
     dist_config = {
-        'CallerReference': f'{name}-{int(time.time())}',
+        'CallerReference': name,
         'Comment': name,
         'Enabled': True,
         'Origins': {'Quantity': 1, 'Items': [{
@@ -176,26 +215,31 @@ def create_distribution(auth, name, origin_domain, waf_acl_arn=None,
     }
     if waf_acl_arn:
         dist_config['WebACLId'] = waf_acl_arn
-    resp = _cf(auth).create_distribution_with_tags(
+    return cf.create_distribution_with_tags(
         DistributionConfigWithTags={
             'DistributionConfig': dist_config,
             'Tags': {'Items': tag_list},
         })['Distribution']
-    return resp
 
 def create_alb(auth, name, vpc_id, subnet_ids, scheme='internet-facing',
                waf_acl_arn=None, tags=None) -> dict:
-    'Create an Application Load Balancer with optional AWS WAF v2 web ACL.'
+    'Create an Application Load Balancer with optional AWS WAF v2 web ACL. Idempotent.'
     client = _elbv2(auth)
     tag_list = [{'Key': k, 'Value': v} for k, v in (tags or {}).items()]
-    alb = client.create_load_balancer(
-        Name=name,
-        Subnets=subnet_ids,
-        Scheme=scheme,
-        Type='application',
-        IpAddressType='ipv4',
-        Tags=tag_list,
-    )['LoadBalancers'][0]
+    try:
+        alb = client.create_load_balancer(
+            Name=name,
+            Subnets=subnet_ids,
+            Scheme=scheme,
+            Type='application',
+            IpAddressType='ipv4',
+            Tags=tag_list,
+        )['LoadBalancers'][0]
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DuplicateLoadBalancerName':
+            alb = client.describe_load_balancers(Names=[name])['LoadBalancers'][0]
+        else:
+            raise
     if waf_acl_arn:
         auth.session.client('wafv2').associate_web_acl(
             WebACLArn=waf_acl_arn, ResourceArn=alb['LoadBalancerArn'])
