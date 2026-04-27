@@ -127,9 +127,9 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
             Tags=tag_list,
         )['DBInstance']
         # Persist credentials so callers can retrieve them later
-        create_secret(auth, f'rds/{name}/master',
-                      _json.dumps({'username': master_username, 'password': password}))
-        inst['MasterSecretArn'] = f'rds/{name}/master'
+        secret = create_secret(auth, f'rds/{name}/master',
+                               _json.dumps({'username': master_username, 'password': password}))
+        inst['MasterSecretArn'] = secret.get('ARN') or secret.get('Name', f'rds/{name}/master')
     except client.exceptions.DBInstanceAlreadyExistsFault:
         inst = client.describe_db_instances(
             DBInstanceIdentifier=name)['DBInstances'][0]
