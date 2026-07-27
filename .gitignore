@@ -2,10 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+*.egg
 dist/
 build/
 .eggs/
 _proc/
 _docs/
 .ipynb_checkpoints/
-*.egg
+.venv/
+.aws-sam/

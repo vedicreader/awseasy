@@ -5,20 +5,29 @@ build-backend = "hatchling.build"
 [project]
 name = "awseasy"
 dynamic = ["version"]
-description = "AWS cloud provisioning for GenAI workloads with enterprise compliance (HIPAA, ISO 27001, SOC 2)"
+description = "AWS provisioning for enterprise GenAI stacks: Bedrock, Cognito SSO, CloudFront, and compliance-by-default"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
-authors = [{name = "vedicreader"}]
-keywords = ["aws", "bedrock", "genai", "llm", "hipaa", "iso27001", "cloud", "devops"]
+authors = [{name = "Karthik", email = "karthik.rajgopal@hotmail.com"}]
+keywords = ['nbdev']
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-    "fastcore>=1.5.29",
-    "boto3>=1.34",
-    "botocore>=1.34",
+    "boto3>=1.35",
+    "botocore>=1.35",
+    "dockeasy>=0.0.5",
+    "fastcore>=1.12.31",
+    "pyjwt[crypto]>=2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "moto[all]>=5.0",
+    "nbdev>=3.0.12",
+    "notebook>=7.5.5",
 ]
 
 [project.urls]
@@ -36,5 +45,16 @@ packages = ["awseasy"]
 
 [tool.nbdev]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/awseasy",
+    "/README.md",
+    "/pyproject.toml",
+]
+
 [dependency-groups]
-dev = ["nbdev>=3.0.12"]
+dev = [
+    "moto[all]>=5.0",
+    "nbdev>=3.0.12",
+    "notebook>=7.5.5",
+]

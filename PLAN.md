@@ -1,246 +1,138 @@
-# awseasy — AWS Cloud Provider for GenAI
+# awseasy — design notes
 
-## Why this exists
+Why the library is shaped the way it is. For the API itself see [`README.md`](README.md), the
+[docs site](https://vedicreader.github.io/awseasy/), or [`awseasy/SKILL.md`](awseasy/SKILL.md).
 
-`awseasy` is the AWS member of the `vedicreader` tool ecosystem:
+## Position
 
-| Tool | Purpose |
-|---|---|
-| dockeasy | Docker/Compose config generation |
-| cfeasy | Cloudflare DNS + Zero Trust tunnels |
-| vpseasy | Hetzner VPS provisioning + deployment |
-| fastops | DevOps toolkit — containers, reverse proxies, VMs |
-| azeasy | Azure cloud provisioning for GenAI workloads |
-| **awseasy** | **AWS cloud provisioning for GenAI workloads** |
+`awseasy` is the AWS member of the `vedicreader` toolchain — `dockeasy` (containers), `cfeasy`
+(Cloudflare), `vpseasy` (Hetzner VPS). All of them are thin, Pythonic wrappers over a provider
+SDK, built with nbdev and fastcore, functional where stateless and class-based only where a
+connection is reused.
 
-The pattern across all tools: thin, Pythonic wrappers over provider SDKs, built with nbdev + fastcore, functional where stateless, small and succinct.
+## Decisions
 
----
+### A library, not an IaC runtime
 
-## Design decisions
+CDK, Pulumi, and Terraform all bring a CLI, a state backend, and a language of their own. That is
+the right trade for a platform team managing an estate; it is the wrong trade for an application
+team that wants to create a bucket and a Bedrock guardrail from the same Python file that runs the
+app. `awseasy` is importable, so it composes with whatever else you use — including being called
+*from inside* a CDK or Terraform provider.
 
-### Raw boto3 SDK (not CDK/Pulumi/Terraform)
+The cost of dropping a state file is that idempotency has to be earned per function. Every
+`create_*` is create-or-update: it looks the resource up first, or catches the already-exists
+error, and re-applies its settings either way. That makes `provision()` a reconciler rather than a
+one-shot, and makes "run the script again" a safe instruction.
 
-`awseasy` is a **Python library / building block**, not a standalone IaC CLI.
+The consequence to know about is that re-running is **declarative, not additive**: calling
+`create_alb(auth, name, subnets)` without a compliance profile after calling it with `**HIPAA`
+relaxes the attributes the profile had set. That is the correct reading of a declarative call, and
+the tests assert it explicitly so it cannot drift into a surprise.
 
-- All sibling tools (vpseasy, fastops, cfeasy, azeasy) wrap provider SDKs directly — no IaC runtime
-- CDK/Pulumi add heavy CLI + state-backend dependencies that don't fit the library model
-- CDK/Terraform users can call `awseasy` functions _inside_ their programs
-- Mitigation: every `create_*` function uses **create-or-update** semantics (idempotent), not blind POST
+### Compliance as validated dicts
 
-### Functional style + thin classes
+A profile is a `Compliance` dict splatted into any call. The alternative designs were a class
+hierarchy (too rigid — controls are not a taxonomy) and free-form kwargs (too loose). The dict
+keeps the call site readable and lets one profile drive a whole stack.
 
-Matching azeasy/vpseasy:
-- **Standalone functions** for stateless ops (`create_bucket`, `invoke_model`, …)
-- **Thin classes** only when a client connection is reused (`AWSAuth`, `GenAIStack`)
-- No unnecessary ceremony, each module < 150 lines
+The one hard rule is that unknown keys raise. In a security library, `Compliance(encryptoin=True)`
+silently doing nothing is a vulnerability with a friendly face.
 
-### Compliance as dict profiles
+The known wart: profiles carry `tags`, so passing both `tags=` and `**HIPAA` is a duplicate-keyword
+`TypeError`. That is explicit and loud, which is the right failure mode, but it is worth knowing.
 
-```python
-HIPAA    = dict(encryption=True, tls_min='1.2', audit=True, multi_az=True,
-                backup_retention=35, deletion_protection=True,
-                tags={'compliance': 'hipaa'})
-ISO27001 = dict(encryption=True, audit=True, managed_role=True,
-                least_privilege=True, tls_min='1.2',
-                tags={'compliance': 'iso27001'})
-SOC2     = dict(encryption=True, audit=True, mfa_required=True,
-                backup_retention=7, tags={'compliance': 'soc2'})
+### Security defaults over security options
+
+Anything that is free to enable and expensive to retrofit is on by default rather than available
+behind a flag:
+
+- Encryption at rest cannot be added to an EBS volume, an EKS secrets store, or an RDS instance
+  after creation — the resource has to be rebuilt. So creation is the only cheap moment.
+- Public access blocks and TLS-only bucket policies are re-applied on every call, including
+  against an existing bucket, which is how drift gets corrected rather than merely detected.
+- `sg_rule` has no `0.0.0.0/0` default. A wrong default in that function is a public database, so
+  it requires exactly one of `cidr=` or `source_sg=` and raises otherwise.
+- `create_app_client` refuses the OAuth implicit flow and plaintext callbacks outright rather than
+  documenting them as unwise.
+
+Where a default would break first use — a private EKS API endpoint is unreachable without a
+bastion — the default matches AWS, and every built-in compliance profile flips it.
+
+### Secrets never round-trip through Python
+
+`create_postgres` uses `ManageMasterUserPassword`, so RDS generates, stores, and rotates the
+credential and it never exists in the process. Where a password genuinely has to be generated —
+the ElastiCache AUTH token, the OpenSearch master user — it goes straight to Secrets Manager and
+the create response is returned without it. `GenAIStack.summary()` returns identifiers only.
+
+No IAM users and no access keys are created anywhere. Roles only.
+
+### Enterprise SSO is a module, not an example
+
+"Security is important, OAuth with enterprise login is important" is the requirement this library
+exists to serve, so `auth` is a first-class module rather than a snippet in the README. It covers
+the whole path: user pool, IdP federation, app client, token verification, and load-balancer
+enforcement. `protect_listener` is the part most worth knowing about — it puts every request behind
+the corporate IdP with no application code, no session store, and no secret handling in the app.
+
+### CloudFront rather than a third-party CDN
+
+`cfeasy` fronts services with Cloudflare. For an enterprise AWS stack, keeping the edge inside AWS
+means one IAM boundary, one audit trail, WAF rules that can reference the same resources, and no
+extra vendor in the compliance scope. `cdn` covers what fronting the stack actually needs: origin
+access control so the bucket never goes public, ACM certificates pinned to us-east-1 (a rule AWS
+enforces late and confusingly), managed WAF rule groups, and Route 53 aliases.
+
+Rate limiting is in the default WAF rule set because for a GenAI application unmetered inference
+is a financial risk, not only an availability one.
+
+### Two paths for container images
+
+`images` supports both, because teams are split. `dockeasy` generates the Dockerfile and builds it
+locally when a daemon is available; CodeBuild does the same work inside AWS when there is not, which
+is usually the better answer in an enterprise — the build runs on an AWS-managed image, under a role
+scoped to one ECR repository, with a CloudWatch log of every build.
+
+## Testing
+
+Notebooks are the source of truth and every one of them is an executable test suite.
+
+`moto` mocks most of what is used here, and its coverage is the reason the test cells look the way
+they do. Where it has gaps — Bedrock inference, Guardrails, OpenSearch Serverless collections,
+CloudFront response headers policies — the tests use `botocore`'s `Stubber`, which asserts the
+exact request parameters being sent. For a library whose entire value is sending hardened
+parameters, that is arguably the stronger assertion of the two.
+
+Pure functions that build a policy or a config document — `distribution_config`, `waf_rules`,
+`bedrock_policy`, `tls_only_policy`, `_aoss_policies`, `ecr_push_policy` — are separated from the
+API calls that send them, so the security-relevant content can be asserted directly rather than
+inferred from a mock's response.
+
+Cells marked `#| eval: False` are integration tests against a real account.
+
+## Authoring
+
+Hand-editing `.ipynb` JSON is unpleasant, so notebooks are authored as plain Python under `nbsrc/`
+with `# %%` cell markers and compiled by `tools/nbbuild.py`. Cell ids are content-hashed, so an
+unchanged cell keeps its id and the generated `# %% ../nbs/...` comments stay stable across builds.
+
+```sh
+python tools/nbbuild.py     # nbsrc/*.py  -> nbs/*.ipynb
+nbdev-export                # nbs/*.ipynb -> awseasy/*.py
+nbdev-test                  # run every notebook
 ```
 
-Every `create_*` function accepts `**compliance_opts`, so compliance requirements compose naturally:
+## Known gaps
 
-```python
-create_bucket(auth, 'phi-data', **HIPAA)
-create_postgres(auth, 'app-db', **HIPAA)
-create_redis(auth, 'cache', **ISO27001)
-```
-
-### Authentication — boto3 credential chain
-
-Supports the full AWS identity chain:
-1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
-2. AWS shared credentials file (`~/.aws/credentials`)
-3. AWS config file (`~/.aws/config`)
-4. EC2/ECS instance profile (IAM role attached to compute)
-5. EKS pod identity / IRSA
-6. AWS SSO via IAM Identity Center
-
-No hardcoded credentials anywhere. Optional `role_arn` for cross-account assume-role.
-
----
-
-## Azure → AWS service mapping
-
-This repo mirrors `azeasy` (azure equivalent) one-for-one:
-
-| azeasy (Azure) | awseasy (AWS) |
-|---|---|
-| `DefaultAzureCredential` | `boto3.Session` credential chain |
-| `AZURE_SUBSCRIPTION_ID` | `AWS_DEFAULT_REGION` + account_id (via STS) |
-| Resource Group | AWS Resource Groups (tag-based query) |
-| Azure OpenAI + `deploy_model()` | Amazon Bedrock `invoke_model()` (serverless) |
-| AI Search | Amazon OpenSearch Service |
-| Blob Storage | Amazon S3 |
-| Cosmos DB | Amazon DynamoDB |
-| PostgreSQL Flexible Server | Amazon RDS PostgreSQL |
-| Redis Cache | Amazon ElastiCache (Redis OSS) |
-| VM | Amazon EC2 |
-| AKS | Amazon EKS |
-| ACR | Amazon ECR |
-| VNet / NSG | VPC / Security Groups |
-| Key Vault | AWS Secrets Manager + KMS |
-| Managed Identity | IAM Role |
-| Private Endpoint | VPC Endpoint |
-| Front Door + WAF | CloudFront + AWS WAF v2 |
-| App Gateway WAF v2 | ALB + AWS WAF v2 |
-
-**Key difference from azeasy:** Bedrock is serverless — there is no `create_openai()` or `deploy_model()` step. Foundation models are invoked directly. Instead, the AI module focuses on `invoke_model()` for direct inference and `create_kb()` for RAG pipeline setup (Bedrock Knowledge Bases backed by OpenSearch + S3).
-
----
-
-## Project structure
-
-```
-awseasy/
-├── nbs/
-│   ├── index.ipynb        # README source (nbdev → README.md)
-│   ├── 00_core.ipynb      # AWSAuth, resource_group, compliance profiles, GenAIStack
-│   ├── 01_ai.ipynb        # Amazon Bedrock + OpenSearch Service
-│   ├── 02_data.ipynb      # S3, DynamoDB, RDS PostgreSQL, ElastiCache Redis
-│   ├── 03_compute.ipynb   # EC2, EKS, ECR
-│   ├── 04_network.ipynb   # VPC/SG, Secrets Manager, IAM, VPC Endpoints,
-│   │                      #   CloudFront, ALB
-│   ├── nbdev.yml
-│   └── _quarto.yml
-├── awseasy/
-│   ├── __init__.py        # (auto-generated by nbdev)
-│   ├── core.py
-│   ├── ai.py
-│   ├── data.py
-│   ├── compute.py
-│   └── network.py
-├── settings.ini           # nbdev project config
-├── pyproject.toml
-├── MANIFEST.in
-└── PLAN.md
-```
-
-Nbdev 3.0+ layout — mirrors azeasy exactly. Notebooks are the source of truth; `.py` files are generated via `nbdev-export`.
-
----
-
-## Module breakdown
-
-### `00_core.ipynb` → `core.py`
-
-```python
-__all__ = ['HIPAA', 'ISO27001', 'SOC2', 'AWSAuth', 'resource_group',
-           'list_resource_groups', 'delete_resource_group', 'GenAIStack']
-```
-
-- **`AWSAuth`** — `boto3.Session` wrapper; reads `AWS_DEFAULT_REGION` from env; optional `role_arn` for assume-role
-- **Compliance profiles** — `HIPAA`, `ISO27001`, `SOC2` as plain dicts
-- **Resource groups** — AWS Resource Groups API (tag-based); mirrors `resource_group()` / `list_rgs()` API from azeasy
-- **`GenAIStack`** — one-call orchestrator: IAM role → Secrets Manager → S3 → OpenSearch → Bedrock KB → DynamoDB → Redis
-
-### `01_ai.ipynb` → `ai.py`
-
-```python
-__all__ = ['list_bedrock_models', 'invoke_model', 'create_kb', 'kb_data_source',
-           'create_opensearch', 'opensearch_endpoint', 'opensearch_admin_creds']
-```
-
-- **`invoke_model()`** — call any Bedrock foundation model; defaults to Claude 3.5 Sonnet
-- **`create_kb()`** — Bedrock Knowledge Base for RAG (OpenSearch Serverless + S3)
-- **`create_opensearch()`** — managed OpenSearch domain with TLS 1.2 + encryption-at-rest
-
-### `02_data.ipynb` → `data.py`
-
-```python
-__all__ = ['create_bucket', 'bucket_url', 'presigned_url', 'bucket_conn',
-           'create_table', 'table_resource', 'dynamo_conn',
-           'create_postgres', 'postgres_conn',
-           'create_redis', 'redis_conn']
-```
-
-- **S3** — public access blocked, SSE-S3, versioning on by default
-- **DynamoDB** — `PAY_PER_REQUEST`, PITR enabled by default
-- **RDS PostgreSQL** — encryption at rest, configurable Multi-AZ + backup retention
-- **ElastiCache Redis** — `TransitEncryptionEnabled` + `AtRestEncryptionEnabled` by default
-
-### `03_compute.ipynb` → `compute.py`
-
-```python
-__all__ = ['create_instance', 'instance_ip', 'start_instance', 'stop_instance',
-           'terminate_instance', 'create_eks', 'eks_kubeconfig', 'scale_eks',
-           'create_ecr', 'ecr_login_url', 'attach_ecr_to_eks']
-```
-
-- **EC2** — IMDSv2 enforced (`HttpTokens=required`); latest Ubuntu 22.04 LTS AMI auto-selected
-- **EKS** — cluster + managed node group; cluster and node IAM roles created automatically
-- **ECR** — scan-on-push + AES256 encryption; `attach_ecr_to_eks()` wires pull permissions
-
-### `04_network.ipynb` → `network.py`
-
-```python
-__all__ = ['create_vpc', 'add_subnet', 'create_security_group', 'sg_rule',
-           'create_secret', 'get_secret', 'update_secret', 'secret_arn',
-           'create_role', 'attach_policy', 'role_arn',
-           'create_vpc_endpoint',
-           'create_distribution', 'create_alb']
-```
-
-- **VPC/SG** — `create_vpc()` enables DNS resolution + hostnames; `sg_rule()` for ingress/egress
-- **Secrets Manager** — create-or-update semantics; optional KMS key
-- **IAM** — `create_role()` + `attach_policy()`; full trust policy or shorthand `service=` param
-- **VPC Endpoints** — Interface and Gateway types; `PrivateDnsEnabled` for Interface endpoints
-- **CloudFront** — HTTPS-only origin, TLS 1.2, optional WAF web ACL
-- **ALB** — Application Load Balancer with optional WAF v2 association
-
----
-
-## Compliance coverage
-
-| Control | How applied |
-|---|---|
-| Encryption at rest | S3 (SSE-S3), DynamoDB, RDS, ElastiCache, ECR — all on by default |
-| Encryption in transit | ElastiCache `TransitEncryptionEnabled`, OpenSearch TLS 1.2, CloudFront/ALB HTTPS-only |
-| No public S3 access | All four `BlockPublicAcls/Policy/Acls/Buckets` settings enforced |
-| IMDSv2 | EC2 `HttpTokens=required` — prevents SSRF credential theft |
-| Audit logging | CloudTrail + CloudWatch integration via `audit=True` compliance flag |
-| Least-privilege | IAM roles + policy attachment; API keys never created |
-| Secret management | Secrets Manager; `get_secret()` returns string, never raw value in resource dict |
-| Data residency | `region` param controls AWS region |
-| PITR | DynamoDB point-in-time recovery always enabled |
-| Backup retention | RDS: `backup_retention` from compliance profile (35 days for HIPAA) |
-| Deletion protection | RDS: `deletion_protection=True` when HIPAA/compliance profile set |
-| Scan on push | ECR image vulnerability scanning always enabled |
-
----
-
-## Implementation order (completed)
-
-1. ✅ **Bootstrap** — `settings.ini`, `pyproject.toml`, `nbs/nbdev.yml`, `nbs/_quarto.yml`, `MANIFEST.in`
-2. ✅ **`00_core.ipynb`** — `AWSAuth`, resource groups, compliance profiles, `GenAIStack` skeleton
-3. ✅ **`01_ai.ipynb`** — Bedrock `invoke_model`, `create_kb`, OpenSearch
-4. ✅ **`02_data.ipynb`** — S3, DynamoDB, RDS PostgreSQL, ElastiCache Redis
-5. ✅ **`03_compute.ipynb`** — EC2, EKS, ECR
-6. ✅ **`04_network.ipynb`** — VPC/SG, Secrets Manager, IAM, VPC Endpoints, CloudFront, ALB
-7. ✅ **Wire `GenAIStack.provision()`** — end-to-end orchestration
-8. ✅ **`nbs/index.ipynb`** — README + usage examples
-9. ✅ **`nbdev-export`** — generate all `.py` files
-10. ✅ **`PLAN.md`** + **`README.md`** — documentation
-
----
-
-## Verification checklist
-
-- [ ] `python -c "from awseasy import *"` succeeds
-- [ ] `python -c "from awseasy.core import HIPAA; print(HIPAA)"` prints profile
-- [ ] With real creds: `AWSAuth()` resolves `region` + `account_id`
-- [ ] `create_bucket(auth, 'test-bucket')` creates encrypted, public-access-blocked bucket
-- [ ] `create_secret(auth, 'test/key', 'val')` stores in Secrets Manager
-- [ ] `invoke_model(auth, 'Hello')` returns response from Claude 3.5 Sonnet
-- [ ] `GenAIStack(auth, 'myapp').provision()` provisions full stack
-- [ ] `create_vpc(auth, 'test-vpc')` creates VPC with DNS enabled
+- **Waiters.** `create_eks`, `create_postgres`, and `create_distribution` return as soon as AWS
+  accepts the request; the resources take minutes to become usable. Callers that need to block
+  should use the boto3 waiters directly. Adding `wait=` parameters is the obvious next step.
+- **No cross-region orchestration.** `GenAIStack` provisions into one region, with the specific
+  exceptions AWS forces (ACM and WAF for CloudFront in us-east-1).
+- **`create_kb` does not create the vector index.** Bedrock requires the OpenSearch index to exist
+  with the right field mappings before the knowledge base will ingest; that needs a signed request
+  to the collection endpoint, which is outside what boto3 offers.
+- **Bedrock model ids move.** `DEFAULT_MODEL` is a starting point; availability is per-region and
+  newer models need a cross-region inference profile. Use `list_bedrock_models()` and
+  `inference_profile()` rather than trusting the constant.

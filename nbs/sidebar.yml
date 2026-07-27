@@ -1,0 +1,12 @@
+website:
+  sidebar:
+    contents:
+      - index.ipynb
+      - 00_core.ipynb
+      - 01_ai.ipynb
+      - 02_data.ipynb
+      - 03_compute.ipynb
+      - 04_network.ipynb
+      - 05_auth.ipynb
+      - 06_cdn.ipynb
+      - 07_images.ipynb

@@ -1,7 +1,11 @@
-__version__ = '0.0.1'
+__version__ = '0.1.0'
 
+# Import order follows the dependency order: core, then everything that builds on it.
 from .core import *
-from .ai import *
-from .data import *
-from .compute import *
 from .network import *
+from .data import *
+from .ai import *
+from .compute import *
+from .auth import *
+from .cdn import *
+from .images import *
