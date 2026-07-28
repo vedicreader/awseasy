@@ -6,11 +6,12 @@ Docs: https://vedicreader.github.io/awseasy/core.html.md"""
 
 # %% auto #0
 __all__ = ['COMPLIANCE_KEYS', 'HIPAA', 'ISO27001', 'SOC2', 'PROFILES', 'Compliance', 'AWSAuth', 'aws_policy', 'tag_list',
-           'tag_dict', 'named', 'create_kms_key', 'kms_key_arn', 'resource_group', 'resource_group_query',
-           'list_resource_groups', 'delete_resource_group', 'GenAIStack', 'repo_root', 'mv_skill_md']
+           'tag_dict', 'named', 'create_kms_key', 'kms_key_arn', 'wait_for', 'poll_until', 'resource_group',
+           'resource_group_query', 'list_resource_groups', 'delete_resource_group', 'GenAIStack', 'repo_root',
+           'mv_skill_md']
 
-# %% ../nbs/00_core.ipynb #7d98512d
-import json, os, boto3
+# %% ../nbs/00_core.ipynb #de584757
+import json, os, time, boto3
 from fastcore.all import L, Path, first
 
 # %% ../nbs/00_core.ipynb #ebb6c159
@@ -126,6 +127,21 @@ def _cmk(auth, name, compliance) -> str:
     'Key ARN for a stack when the profile demands a CMK, else None (falls back to AWS-owned keys).'
     return kms_key_arn(auth, f'{name}-key') if compliance.get('cmk') else None
 
+# %% ../nbs/00_core.ipynb #9bd6fd06
+def wait_for(client, waiter, delay=15, attempts=120, **kw):
+    'Block on a boto3 waiter, with a ceiling generous enough for EKS and RDS (default 30 minutes).'
+    client.get_waiter(waiter).wait(WaiterConfig={'Delay': delay, 'MaxAttempts': attempts}, **kw)
+
+def poll_until(fn, ready, delay=15, timeout=1800, desc='resource'):
+    'Poll fn() until ready(result). For services boto3 gives no waiter for. Returns the last result.'
+    deadline = time.monotonic() + timeout
+    while True:
+        r = fn()
+        if ready(r): return r
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'{desc} was still not ready after {timeout}s')
+        time.sleep(delay)
+
 # %% ../nbs/00_core.ipynb #6e96e033
 def resource_group(auth, name, tags=None) -> dict:
     'Create or update a tag-query Resource Group. Defaults to querying tag ResourceGroup=<name>.'
@@ -157,7 +173,7 @@ def delete_resource_group(auth, name):
     'Delete a resource group. The resources it selected are left untouched.'
     auth.client('resource-groups').delete_group(Group=name)
 
-# %% ../nbs/00_core.ipynb #0b6b620a
+# %% ../nbs/00_core.ipynb #d3f4f94f
 class GenAIStack:
     'Provision a compliance-hardened enterprise GenAI stack on AWS in one call.'
     def __init__(self, auth, name, compliance=None):
@@ -170,16 +186,26 @@ class GenAIStack:
         'Document bucket name — account id included because S3 names are globally unique.'
         return f'{self.name}-{self.auth.account_id}-data'
 
+    @property
+    def ledger(self):
+        'Tag-based inventory of everything this stack provisioned: `.audit()`, `.destroy()`.'
+        from awseasy.ledger import Ledger
+        return Ledger(self.auth, self.name)
+
     def provision(self, s3=True, knowledge_base=True, guardrail=True, dynamodb=True,
-                  redis=False, sso=False, cdn=False, callback_urls=None, domains=None) -> dict:
+                  redis=False, sso=False, cdn=False, callback_urls=None, domains=None,
+                  wait=False) -> dict:
         'Create every enabled resource. Safe to re-run: each step is create-or-update.'
         from awseasy.ai import create_guardrail, create_kb, create_aoss_collection, bedrock_policy
         from awseasy.auth import create_app_client, create_pool_domain, create_user_pool
         from awseasy.cdn import create_distribution, create_waf
         from awseasy.data import create_bucket, create_redis, create_table
+        from awseasy.ledger import ledger_tags
         from awseasy.network import attach_policy, create_role, put_role_policy
 
-        auth, name, c, r = self.auth, self.name, self.compliance, self.resources
+        auth, name, r = self.auth, self.name, self.resources
+        # Every resource carries the stack tag, which is what makes `self.ledger` work.
+        c = self.compliance | dict(tags=ledger_tags(name, self.compliance.get('tags')))
         if c.get('cmk'): r['kms'] = create_kms_key(auth, f'{name}-key', tags=c.get('tags'))
         key_arn = r['kms']['Arn'] if 'kms' in r else None
 
@@ -200,7 +226,8 @@ class GenAIStack:
             r['kb'] = create_kb(auth, f'{name}-kb', bucket=self.bucket, role_arn=role,
                                 collection_arn=r['vectors']['arn'], **c)
         if dynamodb: r['dynamodb'] = create_table(auth, f'{name}-sessions', 'id', kms_key_id=key_arn, **c)
-        if redis: r['redis'] = create_redis(auth, f'{name}-cache', kms_key_id=key_arn, **c)
+        if redis: r['redis'] = create_redis(auth, f'{name}-cache', kms_key_id=key_arn,
+                                            wait=wait, **c)
 
         if sso:
             r['user_pool'] = create_user_pool(auth, f'{name}-users', **c)
@@ -209,9 +236,10 @@ class GenAIStack:
             r['app_client'] = create_app_client(auth, pool_id, f'{name}-web',
                                                 callback_urls=callback_urls or [])
         if cdn:
-            r['waf'] = create_waf(auth, f'{name}-waf', scope='CLOUDFRONT')
+            r['waf'] = create_waf(auth, f'{name}-waf', scope='CLOUDFRONT', tags=c.get('tags'))
             r['cdn'] = create_distribution(auth, name, s3_bucket=self.bucket if s3 else None,
-                                           domains=domains, waf_acl_arn=r['waf']['ARN'], **c)
+                                           domains=domains, waf_acl_arn=r['waf']['ARN'],
+                                           wait=wait, **c)
         return r
 
     def summary(self) -> dict:

@@ -1,4 +1,4 @@
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 # Import order follows the dependency order: core, then everything that builds on it.
 from .core import *
@@ -9,3 +9,4 @@ from .compute import *
 from .auth import *
 from .cdn import *
 from .images import *
+from .ledger import *

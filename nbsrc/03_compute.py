@@ -11,7 +11,7 @@ from nbdev.showdoc import *
 # %% export
 import json, subprocess
 from fastcore.all import L, first
-from awseasy.core import aws_policy, named, tag_list
+from awseasy.core import aws_policy, named, tag_list, wait_for
 from awseasy.network import attach_policy, create_role
 
 # %% hide
@@ -54,7 +54,7 @@ def latest_ubuntu_ami(auth, ver='22.04') -> str:
 
 def create_instance(auth, name, instance_type='t3.medium', ami=None, key_name=None, subnet_id=None,
                     sg_ids=None, iam_instance_profile=None, user_data=None, volume_size=30,
-                    kms_key_id=None, tags=None, **compliance_opts) -> dict:
+                    kms_key_id=None, wait=False, tags=None, **compliance_opts) -> dict:
     'Launch an EC2 instance with IMDSv2 required and an encrypted root volume.'
     ec2 = auth.client('ec2')
     ebs = {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'Encrypted': True,
@@ -73,7 +73,12 @@ def create_instance(auth, name, instance_type='t3.medium', ami=None, key_name=No
     if sg_ids: kw['SecurityGroupIds'] = sg_ids
     if user_data: kw['UserData'] = user_data
     if iam_instance_profile: kw['IamInstanceProfile'] = {'Name': iam_instance_profile}
-    return ec2.run_instances(**kw)['Instances'][0]
+    inst = ec2.run_instances(**kw)['Instances'][0]
+    if wait:
+        wait_for(ec2, 'instance_running', delay=5, attempts=60, InstanceIds=[inst['InstanceId']])
+        inst = ec2.describe_instances(
+            InstanceIds=[inst['InstanceId']])['Reservations'][0]['Instances'][0]
+    return inst
 
 def instance_ip(auth, instance_id) -> str:
     'Public IP if the instance has one, otherwise the private IP.'
@@ -95,7 +100,7 @@ with mock_aws():
     ami = auth.client('ec2').describe_images()['Images'][0]['ImageId']
 
     i = create_instance(auth, 'inference-1', ami=ami, subnet_id=sn['SubnetId'],
-                        sg_ids=[sg['GroupId']], kms_key_id=key['Arn'], **ISO27001)
+                        sg_ids=[sg['GroupId']], kms_key_id=key['Arn'], wait=True, **ISO27001)
     ec2 = auth.client('ec2')
     got = ec2.describe_instances(InstanceIds=[i['InstanceId']])['Reservations'][0]['Instances'][0]
 
@@ -139,7 +144,7 @@ EKS_LOG_TYPES = ['api', 'audit', 'authenticator', 'controllerManager', 'schedule
 
 def create_eks(auth, name, subnet_ids, node_type='m5.large', node_count=2, version='1.31',
                sg_ids=None, kms_key_id=None, public_access=True, public_cidrs=None,
-               audit=False, tags=None, **compliance_opts) -> dict:
+               audit=False, wait=False, tags=None, **compliance_opts) -> dict:
     'Create an EKS cluster and managed node group, with secrets encryption and audit logging.'
     c = auth.client('eks')
     cluster_role = create_role(auth, f'{name}-eks-cluster-role', service='eks.amazonaws.com')
@@ -167,6 +172,11 @@ def create_eks(auth, name, subnet_ids, node_type='m5.large', node_count=2, versi
                            scalingConfig={'minSize': 1, 'maxSize': max(node_count * 2, 2),
                                           'desiredSize': node_count})
     except c.exceptions.ResourceInUseException: pass
+    if wait:
+        # A cluster is ~10 minutes and the node group another ~5, so both need the raised ceiling.
+        wait_for(c, 'cluster_active', name=name)
+        wait_for(c, 'nodegroup_active', clusterName=name, nodegroupName=f'{name}-ng')
+        cluster = c.describe_cluster(name=name)['cluster']
     return cluster
 
 def scale_eks(auth, name, node_count, nodegroup=None):

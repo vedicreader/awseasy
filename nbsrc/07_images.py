@@ -23,7 +23,7 @@ from nbdev.showdoc import *
 import base64, json, os, subprocess, tempfile, time
 from pathlib import Path
 from fastcore.all import L, first
-from awseasy.core import aws_policy, named, tag_list
+from awseasy.core import aws_policy, named, poll_until, tag_list
 from awseasy.compute import create_ecr, ecr_uri
 from awseasy.network import attach_policy, create_role, put_role_policy
 
@@ -231,13 +231,22 @@ def project_drifted(current, wanted) -> bool:
             or env.get('privilegedMode') != w_env['privilegedMode']
             or current.get('serviceRole') != wanted['serviceRole'])
 
-def build_image_in_codebuild(auth, project, tag=None) -> dict:
-    'Start a build. Returns the build record; poll it with `build_status`.'
-    tag = tag or default_tag()
-    return auth.client('codebuild').start_build(
-        projectName=project,
-        environmentVariablesOverride=[{'name': 'IMAGE_TAG', 'value': tag,
-                                       'type': 'PLAINTEXT'}])['build']
+def build_image_in_codebuild(auth, project, tag=None, wait=False) -> dict:
+    'Start a build. wait=True blocks until it finishes and raises if it failed.'
+    c = auth.client('codebuild')
+    build = c.start_build(projectName=project,
+                          environmentVariablesOverride=[{'name': 'IMAGE_TAG',
+                                                         'value': tag or default_tag(),
+                                                         'type': 'PLAINTEXT'}])['build']
+    if wait:
+        # CodeBuild has no boto3 waiter, and a failed build must not look like a successful one.
+        build = poll_until(lambda: c.batch_get_builds(ids=[build['id']])['builds'][0],
+                           lambda b: b['buildStatus'] != 'IN_PROGRESS', delay=10,
+                           desc=f'CodeBuild {project}')
+        if build['buildStatus'] != 'SUCCEEDED':
+            raise RuntimeError(f"build {build['id']} finished {build['buildStatus']}; "
+                               f"logs: {build.get('logs', {}).get('deepLink', 'n/a')}")
+    return build
 
 def build_status(auth, build_id) -> str:
     'IN_PROGRESS, SUCCEEDED, FAILED, ...'

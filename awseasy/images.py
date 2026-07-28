@@ -9,11 +9,11 @@ __all__ = ['BUILD_IMAGE', 'ecr_credentials', 'ecr_login', 'default_tag', 'build_
            'buildspec', 'ecr_push_policy', 'codebuild_role', 'create_image_project', 'project_drifted',
            'build_image_in_codebuild', 'build_status', 'upload_source']
 
-# %% ../nbs/07_images.ipynb #4f883e24
+# %% ../nbs/07_images.ipynb #20ebb296
 import base64, json, os, subprocess, tempfile, time
 from pathlib import Path
 from fastcore.all import L, first
-from .core import aws_policy, named, tag_list
+from .core import aws_policy, named, poll_until, tag_list
 from .compute import create_ecr, ecr_uri
 from .network import attach_policy, create_role, put_role_policy
 
@@ -66,7 +66,7 @@ def scan_findings(auth, repo, tag) -> dict:
                                                         imageId={'imageTag': tag})
     return r.get('imageScanFindings', {}).get('findingSeverityCounts', {})
 
-# %% ../nbs/07_images.ipynb #f928c4b1
+# %% ../nbs/07_images.ipynb #c053922c
 BUILD_IMAGE = 'aws/codebuild/standard:7.0'
 
 def buildspec(auth, repo, dockerfile='Dockerfile', context='.') -> str:
@@ -159,13 +159,22 @@ def project_drifted(current, wanted) -> bool:
             or env.get('privilegedMode') != w_env['privilegedMode']
             or current.get('serviceRole') != wanted['serviceRole'])
 
-def build_image_in_codebuild(auth, project, tag=None) -> dict:
-    'Start a build. Returns the build record; poll it with `build_status`.'
-    tag = tag or default_tag()
-    return auth.client('codebuild').start_build(
-        projectName=project,
-        environmentVariablesOverride=[{'name': 'IMAGE_TAG', 'value': tag,
-                                       'type': 'PLAINTEXT'}])['build']
+def build_image_in_codebuild(auth, project, tag=None, wait=False) -> dict:
+    'Start a build. wait=True blocks until it finishes and raises if it failed.'
+    c = auth.client('codebuild')
+    build = c.start_build(projectName=project,
+                          environmentVariablesOverride=[{'name': 'IMAGE_TAG',
+                                                         'value': tag or default_tag(),
+                                                         'type': 'PLAINTEXT'}])['build']
+    if wait:
+        # CodeBuild has no boto3 waiter, and a failed build must not look like a successful one.
+        build = poll_until(lambda: c.batch_get_builds(ids=[build['id']])['builds'][0],
+                           lambda b: b['buildStatus'] != 'IN_PROGRESS', delay=10,
+                           desc=f'CodeBuild {project}')
+        if build['buildStatus'] != 'SUCCEEDED':
+            raise RuntimeError(f"build {build['id']} finished {build['buildStatus']}; "
+                               f"logs: {build.get('logs', {}).get('deepLink', 'n/a')}")
+    return build
 
 def build_status(auth, build_id) -> str:
     'IN_PROGRESS, SUCCEEDED, FAILED, ...'

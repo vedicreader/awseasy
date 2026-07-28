@@ -10,3 +10,4 @@ website:
       - 05_auth.ipynb
       - 06_cdn.ipynb
       - 07_images.ipynb
+      - 08_ledger.ipynb

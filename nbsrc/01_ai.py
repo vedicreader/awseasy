@@ -10,7 +10,7 @@ from nbdev.showdoc import *
 
 # %% export
 import json, secrets, string
-from awseasy.core import named, tag_list
+from awseasy.core import named, poll_until, tag_list
 from awseasy.network import create_secret, get_secret
 
 # %% hide
@@ -484,7 +484,8 @@ def _password(n=24) -> str:
 
 def create_opensearch(auth, name, engine_version='OpenSearch_2.13', instance_type='r6g.large.search',
                       instance_count=1, volume_size=20, master_user='os-admin', kms_key_id=None,
-                      subnet_ids=None, sg_ids=None, audit=False, tags=None, **compliance_opts) -> dict:
+                      subnet_ids=None, sg_ids=None, audit=False, wait=False, tags=None,
+                      **compliance_opts) -> dict:
     'Create an OpenSearch domain with TLS 1.2, encryption everywhere, and fine-grained access control.'
     c = auth.client('opensearch')
     password = _password()
@@ -508,11 +509,17 @@ def create_opensearch(auth, name, engine_version='OpenSearch_2.13', instance_typ
             'Enabled': True}}
     try:
         domain = c.create_domain(**kw)['DomainStatus']
+        # The only copy of the password leaves this process straight into Secrets Manager.
+        create_secret(auth, f'opensearch/{name}/admin',
+                      {'username': master_user, 'password': password},
+                      kms_key_id=kms_key_id, description=f'OpenSearch master user for {name}')
     except c.exceptions.ResourceAlreadyExistsException:
-        return c.describe_domain(DomainName=name)['DomainStatus']
-    # The only copy of the password leaves this process straight into Secrets Manager.
-    create_secret(auth, f'opensearch/{name}/admin', {'username': master_user, 'password': password},
-                  kms_key_id=kms_key_id, description=f'OpenSearch master user for {name}')
+        domain = c.describe_domain(DomainName=name)['DomainStatus']
+    if wait:
+        # OpenSearch has no boto3 waiter; Processing stays true until the domain settles.
+        domain = poll_until(lambda: c.describe_domain(DomainName=name)['DomainStatus'],
+                            lambda d: not d.get('Processing') and d.get('Endpoint'),
+                            desc=f'OpenSearch domain {name}')
     return domain
 
 def opensearch_endpoint(auth, name) -> str:

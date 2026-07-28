@@ -10,9 +10,9 @@ __all__ = ['DEFAULT_MODEL', 'EMBED_MODEL', 'CONTENT_FILTERS', 'PII_ENTITIES', 'i
            'create_kb', 'kb_data_source', 'sync_kb', 'create_opensearch', 'opensearch_endpoint',
            'opensearch_admin_creds']
 
-# %% ../nbs/01_ai.ipynb #dc864238
+# %% ../nbs/01_ai.ipynb #2369fef3
 import json, secrets, string
-from .core import named, tag_list
+from .core import named, poll_until, tag_list
 from .network import create_secret, get_secret
 
 # %% ../nbs/01_ai.ipynb #92453207
@@ -185,7 +185,7 @@ def sync_kb(auth, kb_id, data_source_id) -> dict:
     return auth.client('bedrock-agent').start_ingestion_job(
         knowledgeBaseId=kb_id, dataSourceId=data_source_id)['ingestionJob']
 
-# %% ../nbs/01_ai.ipynb #d4bc8522
+# %% ../nbs/01_ai.ipynb #f4baca8c
 def _password(n=24) -> str:
     'Password meeting the OpenSearch master-user rules: upper, lower, digit, and symbol.'
     pools = [string.ascii_uppercase, string.ascii_lowercase, string.digits, '!@#$%^&*()-_=+']
@@ -196,7 +196,8 @@ def _password(n=24) -> str:
 
 def create_opensearch(auth, name, engine_version='OpenSearch_2.13', instance_type='r6g.large.search',
                       instance_count=1, volume_size=20, master_user='os-admin', kms_key_id=None,
-                      subnet_ids=None, sg_ids=None, audit=False, tags=None, **compliance_opts) -> dict:
+                      subnet_ids=None, sg_ids=None, audit=False, wait=False, tags=None,
+                      **compliance_opts) -> dict:
     'Create an OpenSearch domain with TLS 1.2, encryption everywhere, and fine-grained access control.'
     c = auth.client('opensearch')
     password = _password()
@@ -220,11 +221,17 @@ def create_opensearch(auth, name, engine_version='OpenSearch_2.13', instance_typ
             'Enabled': True}}
     try:
         domain = c.create_domain(**kw)['DomainStatus']
+        # The only copy of the password leaves this process straight into Secrets Manager.
+        create_secret(auth, f'opensearch/{name}/admin',
+                      {'username': master_user, 'password': password},
+                      kms_key_id=kms_key_id, description=f'OpenSearch master user for {name}')
     except c.exceptions.ResourceAlreadyExistsException:
-        return c.describe_domain(DomainName=name)['DomainStatus']
-    # The only copy of the password leaves this process straight into Secrets Manager.
-    create_secret(auth, f'opensearch/{name}/admin', {'username': master_user, 'password': password},
-                  kms_key_id=kms_key_id, description=f'OpenSearch master user for {name}')
+        domain = c.describe_domain(DomainName=name)['DomainStatus']
+    if wait:
+        # OpenSearch has no boto3 waiter; Processing stays true until the domain settles.
+        domain = poll_until(lambda: c.describe_domain(DomainName=name)['DomainStatus'],
+                            lambda d: not d.get('Processing') and d.get('Endpoint'),
+                            desc=f'OpenSearch domain {name}')
     return domain
 
 def opensearch_endpoint(auth, name) -> str:

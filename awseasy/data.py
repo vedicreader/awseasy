@@ -8,9 +8,9 @@ Docs: https://vedicreader.github.io/awseasy/data.html.md"""
 __all__ = ['tls_only_policy', 'create_bucket', 'bucket_url', 'presigned_url', 'create_table', 'table_resource', 'create_postgres',
            'postgres_conn', 'postgres_password', 'postgres_iam_token', 'create_redis', 'redis_auth_token', 'redis_conn']
 
-# %% ../nbs/02_data.ipynb #ec8f6ffd
+# %% ../nbs/02_data.ipynb #9377ffec
 import json, secrets
-from .core import named, tag_list
+from .core import named, tag_list, wait_for
 from .network import create_secret, get_secret
 
 # %% ../nbs/02_data.ipynb #68c5107f
@@ -88,11 +88,11 @@ def table_resource(auth, name):
     'boto3 DynamoDB Table resource, for get_item/put_item/query against the provisioned table.'
     return auth.resource('dynamodb').Table(name)
 
-# %% ../nbs/02_data.ipynb #ea3ea7bb
+# %% ../nbs/02_data.ipynb #8c9cc7da
 def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='16.4',
                     master_username='pgadmin', storage=20, kms_key_id=None, subnet_group=None,
                     sg_ids=None, multi_az=False, deletion_protection=False, backup_retention=7,
-                    audit=False, tags=None, **compliance_opts) -> dict:
+                    audit=False, wait=False, tags=None, **compliance_opts) -> dict:
     'Create an encrypted, private RDS PostgreSQL instance. RDS generates and holds the master password.'
     c = auth.client('rds')
     kw = dict(DBInstanceIdentifier=name, DBInstanceClass=instance_class, Engine='postgres',
@@ -107,9 +107,14 @@ def create_postgres(auth, name, instance_class='db.t3.medium', engine_version='1
     if subnet_group: kw['DBSubnetGroupName'] = subnet_group
     if sg_ids: kw['VpcSecurityGroupIds'] = sg_ids
     if audit: kw['EnableCloudwatchLogsExports'] = ['postgresql', 'upgrade']
-    try: return c.create_db_instance(**kw)['DBInstance']
+    try: db = c.create_db_instance(**kw)['DBInstance']
     except c.exceptions.DBInstanceAlreadyExistsFault:
-        return c.describe_db_instances(DBInstanceIdentifier=name)['DBInstances'][0]
+        db = c.describe_db_instances(DBInstanceIdentifier=name)['DBInstances'][0]
+    if wait:
+        # A new instance takes several minutes; the default waiter gives up too early.
+        wait_for(c, 'db_instance_available', DBInstanceIdentifier=name)
+        db = c.describe_db_instances(DBInstanceIdentifier=name)['DBInstances'][0]
+    return db
 
 def postgres_conn(auth, name, db='postgres') -> str:
     'A postgresql:// URL with no password in it. Fetch the password separately, or use an IAM token.'
@@ -131,10 +136,11 @@ def postgres_iam_token(auth, name, user, db='postgres') -> str:
     return auth.client('rds').generate_db_auth_token(
         DBHostname=i['Endpoint']['Address'], Port=i['Endpoint']['Port'], DBUsername=user)
 
-# %% ../nbs/02_data.ipynb #0f2b4d71
+# %% ../nbs/02_data.ipynb #74b78ec3
 def create_redis(auth, name, node_type='cache.t4g.micro', num_shards=1, replicas=0,
                  engine_version='7.1', kms_key_id=None, subnet_group=None, sg_ids=None,
-                 multi_az=False, backup_retention=0, tags=None, **compliance_opts) -> dict:
+                 multi_az=False, backup_retention=0, wait=False, tags=None,
+                 **compliance_opts) -> dict:
     'Create an encrypted ElastiCache Redis replication group; the AUTH token goes to Secrets Manager.'
     c = auth.client('elasticache')
     if multi_az: replicas = max(replicas, 1)      # automatic failover needs at least one replica
@@ -150,10 +156,13 @@ def create_redis(auth, name, node_type='cache.t4g.micro', num_shards=1, replicas
     if sg_ids: kw['SecurityGroupIds'] = sg_ids
     try:
         rg = c.create_replication_group(**kw)['ReplicationGroup']
+        create_secret(auth, f'elasticache/{name}/auth-token', token, kms_key_id=kms_key_id,
+                      description=f'ElastiCache AUTH token for {name}')
     except c.exceptions.ReplicationGroupAlreadyExistsFault:
-        return c.describe_replication_groups(ReplicationGroupId=name)['ReplicationGroups'][0]
-    create_secret(auth, f'elasticache/{name}/auth-token', token, kms_key_id=kms_key_id,
-                  description=f'ElastiCache AUTH token for {name}')
+        rg = c.describe_replication_groups(ReplicationGroupId=name)['ReplicationGroups'][0]
+    if wait:
+        wait_for(c, 'replication_group_available', ReplicationGroupId=name)
+        rg = c.describe_replication_groups(ReplicationGroupId=name)['ReplicationGroups'][0]
     return rg
 
 def redis_auth_token(auth, name) -> str:

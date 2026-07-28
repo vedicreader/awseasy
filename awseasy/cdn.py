@@ -10,22 +10,28 @@ __all__ = ['CF_HOSTED_ZONE', 'MANAGED_RULES', 'CACHE_OPTIMIZED', 'CACHE_DISABLED
            'security_headers_policy', 'waf_rules', 'create_waf', 'distribution_config', 'create_distribution',
            'distribution_domain', 'invalidate', 'alias_record', 'zone_id']
 
-# %% ../nbs/06_cdn.ipynb #d5039354
+# %% ../nbs/06_cdn.ipynb #32f140f0
 import json, time
 from fastcore.all import L, first
-from .core import tag_list
+from .core import tag_list, wait_for
 
-# %% ../nbs/06_cdn.ipynb #c3a21876
+# %% ../nbs/06_cdn.ipynb #c789dc87
 CF_HOSTED_ZONE = 'Z2FDTNDATAQYW2'   # fixed, global: every CloudFront alias target uses this
 
 def request_cert(auth, domain, alt_names=None, region='us-east-1', validation='DNS',
-                 tags=None) -> str:
-    'Request an ACM certificate and return its ARN. Defaults to us-east-1, as CloudFront requires.'
+                 wait=False, tags=None) -> str:
+    '''Request an ACM certificate and return its ARN. Defaults to us-east-1, as CloudFront requires.
+
+    `wait=True` blocks until the certificate is ISSUED, which only happens once the DNS records
+    from `cert_validation_records()` are published — so publish them first, or this will time out.'''
     kw = dict(DomainName=domain, ValidationMethod=validation,
               Options={'CertificateTransparencyLoggingPreference': 'ENABLED'},
               Tags=tag_list(tags) or [{'Key': 'Name', 'Value': domain}])
     if alt_names: kw['SubjectAlternativeNames'] = list(alt_names)
-    return auth.client('acm', region=region).request_certificate(**kw)['CertificateArn']
+    c = auth.client('acm', region=region)
+    arn = c.request_certificate(**kw)['CertificateArn']
+    if wait: wait_for(c, 'certificate_validated', delay=20, attempts=60, CertificateArn=arn)
+    return arn
 
 def cert_validation_records(auth, cert_arn, region='us-east-1') -> list:
     'CNAME records to publish so ACM can validate the certificate. Empty until ACM populates them.'
@@ -118,7 +124,7 @@ def create_waf(auth, name, scope='CLOUDFRONT', managed_rules=None, rate_limit=20
     if tags: kw['Tags'] = tag_list(tags)   # wafv2 rejects an empty tag list
     return c.create_web_acl(**kw)['Summary']
 
-# %% ../nbs/06_cdn.ipynb #053cf3c9
+# %% ../nbs/06_cdn.ipynb #e6e70d94
 CACHE_OPTIMIZED = '658327ea-f89d-4fab-a63d-7e88639e58f6'   # AWS managed: CachingOptimized
 CACHE_DISABLED = '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'    # AWS managed: CachingDisabled
 ALL_VIEWER_EXCEPT_HOST = 'b689b0a8-53d0-40ab-baf2-68738e2966ac'   # managed origin request policy
@@ -188,8 +194,11 @@ def _find_distribution(client, caller_ref):
                      'cannot see; pass a different name')
 
 def create_distribution(auth, name, origin_domain=None, s3_bucket=None, oac_id=None, tags=None,
-                        **kw) -> dict:
-    'Create a hardened CloudFront distribution. Idempotent by name; wires OAC for S3 origins.'
+                        wait=False, **kw) -> dict:
+    '''Create a hardened CloudFront distribution. Idempotent by name; wires OAC for S3 origins.
+
+    A distribution takes several minutes to reach every edge location. `wait=True` blocks until
+    it is Deployed — otherwise requests to it 404 for a while after this call returns.'''
     c = auth.client('cloudfront', region='us-east-1')
     if s3_bucket and not oac_id: oac_id = create_oac(auth, f'{name}-oac')
     cfg = distribution_config(auth, name, origin_domain=origin_domain, s3_bucket=s3_bucket,
@@ -200,6 +209,9 @@ def create_distribution(auth, name, origin_domain=None, s3_bucket=None, oac_id=N
     except c.exceptions.DistributionAlreadyExists:
         dist = _find_distribution(c, cfg['CallerReference'])
     if s3_bucket: s3_oac_policy(auth, s3_bucket, dist['ARN'])
+    if wait:
+        wait_for(c, 'distribution_deployed', delay=30, attempts=60, Id=dist['Id'])
+        dist = c.get_distribution(Id=dist['Id'])['Distribution']
     return dist
 
 def distribution_domain(auth, dist_id) -> str:

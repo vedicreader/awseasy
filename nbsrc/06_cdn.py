@@ -17,7 +17,7 @@ from nbdev.showdoc import *
 # %% export
 import json, time
 from fastcore.all import L, first
-from awseasy.core import tag_list
+from awseasy.core import tag_list, wait_for
 
 # %% hide
 import os
@@ -51,13 +51,19 @@ def stub_auth(region='us-east-1'):
 CF_HOSTED_ZONE = 'Z2FDTNDATAQYW2'   # fixed, global: every CloudFront alias target uses this
 
 def request_cert(auth, domain, alt_names=None, region='us-east-1', validation='DNS',
-                 tags=None) -> str:
-    'Request an ACM certificate and return its ARN. Defaults to us-east-1, as CloudFront requires.'
+                 wait=False, tags=None) -> str:
+    '''Request an ACM certificate and return its ARN. Defaults to us-east-1, as CloudFront requires.
+
+    `wait=True` blocks until the certificate is ISSUED, which only happens once the DNS records
+    from `cert_validation_records()` are published — so publish them first, or this will time out.'''
     kw = dict(DomainName=domain, ValidationMethod=validation,
               Options={'CertificateTransparencyLoggingPreference': 'ENABLED'},
               Tags=tag_list(tags) or [{'Key': 'Name', 'Value': domain}])
     if alt_names: kw['SubjectAlternativeNames'] = list(alt_names)
-    return auth.client('acm', region=region).request_certificate(**kw)['CertificateArn']
+    c = auth.client('acm', region=region)
+    arn = c.request_certificate(**kw)['CertificateArn']
+    if wait: wait_for(c, 'certificate_validated', delay=20, attempts=60, CertificateArn=arn)
+    return arn
 
 def cert_validation_records(auth, cert_arn, region='us-east-1') -> list:
     'CNAME records to publish so ACM can validate the certificate. Empty until ACM populates them.'
@@ -371,8 +377,11 @@ def _find_distribution(client, caller_ref):
                      'cannot see; pass a different name')
 
 def create_distribution(auth, name, origin_domain=None, s3_bucket=None, oac_id=None, tags=None,
-                        **kw) -> dict:
-    'Create a hardened CloudFront distribution. Idempotent by name; wires OAC for S3 origins.'
+                        wait=False, **kw) -> dict:
+    '''Create a hardened CloudFront distribution. Idempotent by name; wires OAC for S3 origins.
+
+    A distribution takes several minutes to reach every edge location. `wait=True` blocks until
+    it is Deployed — otherwise requests to it 404 for a while after this call returns.'''
     c = auth.client('cloudfront', region='us-east-1')
     if s3_bucket and not oac_id: oac_id = create_oac(auth, f'{name}-oac')
     cfg = distribution_config(auth, name, origin_domain=origin_domain, s3_bucket=s3_bucket,
@@ -383,6 +392,9 @@ def create_distribution(auth, name, origin_domain=None, s3_bucket=None, oac_id=N
     except c.exceptions.DistributionAlreadyExists:
         dist = _find_distribution(c, cfg['CallerReference'])
     if s3_bucket: s3_oac_policy(auth, s3_bucket, dist['ARN'])
+    if wait:
+        wait_for(c, 'distribution_deployed', delay=30, attempts=60, Id=dist['Id'])
+        dist = c.get_distribution(Id=dist['Id'])['Distribution']
     return dist
 
 def distribution_domain(auth, dist_id) -> str:

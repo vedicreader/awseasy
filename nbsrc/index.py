@@ -7,6 +7,7 @@ from awseasy.compute import *
 from awseasy.auth import *
 from awseasy.cdn import *
 from awseasy.images import *
+from awseasy.ledger import *
 
 # %% md
 # # awseasy
@@ -202,6 +203,51 @@ from awseasy.images import *
 # ```
 
 # %% md
+# ## Inventory, audit, and teardown
+#
+# There is no state file. Every resource carries an `awseasy:stack` tag, and the Resource Groups
+# Tagging API indexes tags across every service — so AWS itself is the state store.
+#
+# ```python
+# led = stack.ledger              # or Ledger(auth, 'acme-copilot')
+# led.by_service()                # what this stack actually consists of
+# led.audit()                     # security findings across every resource in it
+# led.destroy()                   # dry run by default; dependents deleted before dependencies
+# led.destroy(dry_run=False)
+# ```
+#
+# `audit()` re-reads the live configuration, so it catches settings changed in the console after
+# provisioning — drift detection for the controls that matter. It is limited to controls that are
+# wrong under any policy (publicly reachable, unencrypted, no backups, mutable image tags);
+# choices that belong to a compliance profile are not reported as failures.
+#
+# `adopt()` does something a state file cannot — it pulls resources created by the console,
+# Terraform, or a colleague's script into the same inventory, so the audit and the teardown cover
+# them too:
+#
+# ```python
+# led.adopt(['arn:aws:s3:::legacy-bucket'])
+# for f in led.audit(): print(f"FAIL {f['check']:32} {f['name']}  {f['detail']}")
+# ```
+#
+# `destroy()` reports anything it has no deleter for under `unsupported` rather than skipping it.
+# A teardown that quietly leaves resources behind is worse than one that refuses, because the
+# bill arrives either way.
+
+# %% md
+# ## Waiting
+#
+# Most calls return as soon as AWS accepts the request, which is minutes before the resource is
+# usable. Every slow creator takes `wait=`:
+#
+# ```python
+# db = create_postgres(auth, 'app-db', wait=True, **HIPAA)      # ~5 minutes
+# create_eks(auth, 'inference', subnets, wait=True, **ISO27001) # ~15 minutes, cluster + nodes
+# create_distribution(auth, 'acme', s3_bucket='site', wait=True)
+# build_image_in_codebuild(auth, 'api-build', wait=True)        # raises if the build failed
+# ```
+
+# %% md
 # ## Modules
 #
 # | Module | Covers |
@@ -214,6 +260,7 @@ from awseasy.images import *
 # | [`auth`](auth.html) | Cognito user pools, SSO federation, app clients, JWT verification, ALB-enforced login |
 # | [`cdn`](cdn.html) | CloudFront, AWS WAF, ACM, Route 53 |
 # | [`images`](images.html) | ECR login, local builds via dockeasy, CodeBuild image pipelines |
+# | [`ledger`](ledger.html) | Tag-based inventory, security audit, and teardown — no state file |
 
 # %% md
 # ## Security posture

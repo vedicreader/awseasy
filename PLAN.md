@@ -125,9 +125,14 @@ nbdev-test                  # run every notebook
 
 ## Known gaps
 
-- **Waiters.** `create_eks`, `create_postgres`, and `create_distribution` return as soon as AWS
-  accepts the request; the resources take minutes to become usable. Callers that need to block
-  should use the boto3 waiters directly. Adding `wait=` parameters is the obvious next step.
+- **No dependency graph.** `Ledger.destroy()` orders deletions by a hand-written service ranking,
+  not by actual references between resources. It is right for the shapes this library builds and
+  wrong for anything unusual, which is the honest cost of not having an engine.
+- **No preview diff.** `destroy(dry_run=True)` shows what would be deleted, but there is no
+  equivalent for changes — nothing tells you what `provision()` is about to alter.
+- **The ledger is only as good as the tagging API.** It is eventually consistent, and it does not
+  index every service — IAM roles and CloudFront distributions are notable absences, so they will
+  not appear in an inventory and cannot be torn down by it.
 - **No cross-region orchestration.** `GenAIStack` provisions into one region, with the specific
   exceptions AWS forces (ACM and WAF for CloudFront in us-east-1).
 - **`create_kb` does not create the vector index.** Bedrock requires the OpenSearch index to exist

@@ -9,7 +9,7 @@
 from nbdev.showdoc import *
 
 # %% export
-import json, os, boto3
+import json, os, time, boto3
 from fastcore.all import L, Path, first
 
 # %% hide
@@ -235,6 +235,62 @@ with mock_aws():
     print(k['Arn'])
 
 # %% md
+# ## Waiting
+#
+# Most `create_*` calls return as soon as AWS accepts the request. An RDS instance takes minutes
+# to become available, an EKS cluster ten or more, and a CloudFront distribution can take longer
+# still — so anything that depends on the resource has to wait.
+#
+# Every slow creator takes `wait=False`. Set it to `True` and the call blocks until the resource
+# is genuinely usable. The boto3 waiter defaults are usually too short for these resources
+# (`db_instance_available` gives up after 60 attempts at 30s), so `wait_for` raises the ceiling.
+#
+# `poll_until` covers the services with no waiter at all — OpenSearch, CodeBuild, Cognito.
+
+# %% export
+def wait_for(client, waiter, delay=15, attempts=120, **kw):
+    'Block on a boto3 waiter, with a ceiling generous enough for EKS and RDS (default 30 minutes).'
+    client.get_waiter(waiter).wait(WaiterConfig={'Delay': delay, 'MaxAttempts': attempts}, **kw)
+
+def poll_until(fn, ready, delay=15, timeout=1800, desc='resource'):
+    'Poll fn() until ready(result). For services boto3 gives no waiter for. Returns the last result.'
+    deadline = time.monotonic() + timeout
+    while True:
+        r = fn()
+        if ready(r): return r
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'{desc} was still not ready after {timeout}s')
+        time.sleep(delay)
+
+# %% code
+# poll_until is a plain loop, so drive it with a counter rather than a cloud resource.
+calls = []
+def flaky():
+    calls.append(1)
+    return {'Status': 'AVAILABLE' if len(calls) >= 3 else 'CREATING'}
+
+r = poll_until(flaky, lambda x: x['Status'] == 'AVAILABLE', delay=0)
+assert r['Status'] == 'AVAILABLE' and len(calls) == 3
+
+# a resource that never becomes ready raises rather than hanging forever
+try:
+    poll_until(lambda: {'Status': 'CREATING'}, lambda x: False, delay=0, timeout=0, desc='test db')
+    raise AssertionError('should have timed out')
+except TimeoutError as e: assert 'test db' in str(e)
+print('poll_until OK')
+
+# %% code
+with mock_aws():
+    # wait_for drives a real boto3 waiter; under moto the resource is immediately available.
+    auth = AWSAuth(region='us-east-1')
+    auth.client('rds').create_db_instance(
+        DBInstanceIdentifier='waiter-db', DBInstanceClass='db.t3.micro', Engine='postgres',
+        MasterUsername='pgadmin', ManageMasterUserPassword=True, AllocatedStorage=20)
+    wait_for(auth.client('rds'), 'db_instance_available', delay=1, attempts=3,
+             DBInstanceIdentifier='waiter-db')
+    print('wait_for OK')
+
+# %% md
 # ## Resource groups
 #
 # AWS has no folder-like container equivalent to an Azure resource group. The closest
@@ -317,16 +373,26 @@ class GenAIStack:
         'Document bucket name — account id included because S3 names are globally unique.'
         return f'{self.name}-{self.auth.account_id}-data'
 
+    @property
+    def ledger(self):
+        'Tag-based inventory of everything this stack provisioned: `.audit()`, `.destroy()`.'
+        from awseasy.ledger import Ledger
+        return Ledger(self.auth, self.name)
+
     def provision(self, s3=True, knowledge_base=True, guardrail=True, dynamodb=True,
-                  redis=False, sso=False, cdn=False, callback_urls=None, domains=None) -> dict:
+                  redis=False, sso=False, cdn=False, callback_urls=None, domains=None,
+                  wait=False) -> dict:
         'Create every enabled resource. Safe to re-run: each step is create-or-update.'
         from awseasy.ai import create_guardrail, create_kb, create_aoss_collection, bedrock_policy
         from awseasy.auth import create_app_client, create_pool_domain, create_user_pool
         from awseasy.cdn import create_distribution, create_waf
         from awseasy.data import create_bucket, create_redis, create_table
+        from awseasy.ledger import ledger_tags
         from awseasy.network import attach_policy, create_role, put_role_policy
 
-        auth, name, c, r = self.auth, self.name, self.compliance, self.resources
+        auth, name, r = self.auth, self.name, self.resources
+        # Every resource carries the stack tag, which is what makes `self.ledger` work.
+        c = self.compliance | dict(tags=ledger_tags(name, self.compliance.get('tags')))
         if c.get('cmk'): r['kms'] = create_kms_key(auth, f'{name}-key', tags=c.get('tags'))
         key_arn = r['kms']['Arn'] if 'kms' in r else None
 
@@ -347,7 +413,8 @@ class GenAIStack:
             r['kb'] = create_kb(auth, f'{name}-kb', bucket=self.bucket, role_arn=role,
                                 collection_arn=r['vectors']['arn'], **c)
         if dynamodb: r['dynamodb'] = create_table(auth, f'{name}-sessions', 'id', kms_key_id=key_arn, **c)
-        if redis: r['redis'] = create_redis(auth, f'{name}-cache', kms_key_id=key_arn, **c)
+        if redis: r['redis'] = create_redis(auth, f'{name}-cache', kms_key_id=key_arn,
+                                            wait=wait, **c)
 
         if sso:
             r['user_pool'] = create_user_pool(auth, f'{name}-users', **c)
@@ -356,9 +423,10 @@ class GenAIStack:
             r['app_client'] = create_app_client(auth, pool_id, f'{name}-web',
                                                 callback_urls=callback_urls or [])
         if cdn:
-            r['waf'] = create_waf(auth, f'{name}-waf', scope='CLOUDFRONT')
+            r['waf'] = create_waf(auth, f'{name}-waf', scope='CLOUDFRONT', tags=c.get('tags'))
             r['cdn'] = create_distribution(auth, name, s3_bucket=self.bucket if s3 else None,
-                                           domains=domains, waf_acl_arn=r['waf']['ARN'], **c)
+                                           domains=domains, waf_acl_arn=r['waf']['ARN'],
+                                           wait=wait, **c)
         return r
 
     def summary(self) -> dict:

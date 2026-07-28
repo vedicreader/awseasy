@@ -2,6 +2,52 @@
 
 <!-- do not remove -->
 
+## 0.2.0
+
+Closes the two gaps `0.1.0` documented as known: no teardown and no waiting.
+
+### New module: `ledger`
+
+Provisioning without an IaC engine normally means you cannot say what you created, so you cannot
+tear it down or tell when it drifted. The answer here is to use AWS as the state store rather than
+a file: every resource carries an `awseasy:stack` tag, and the Resource Groups Tagging API indexes
+tags across every service in the account.
+
+- `Ledger(auth, stack)` — `resources()`, `arns()`, `by_service()`, and `repr` for a quick read of
+  what a stack consists of. `GenAIStack` exposes its own as `stack.ledger`.
+- `audit()` re-reads live configuration and reports security findings, so it catches settings
+  changed in the console after provisioning. Checks are limited to controls that are wrong under
+  any policy — publicly reachable, unencrypted, no backups, mutable image tags. Choices that
+  belong to a compliance profile are deliberately not reported, because an audit that flags things
+  which are fine trains people to ignore it. Unknown resource types report as
+  `<service>:unchecked`, never as passing.
+- `destroy()` deletes dependents before dependencies, defaults to `dry_run=True`, and lists
+  anything it has no deleter for under `unsupported` rather than skipping it. A teardown that
+  quietly leaves resources behind is worse than one that refuses. One failed delete does not stop
+  the rest. KMS keys are scheduled for deletion rather than deleted, and S3 buckets are emptied of
+  every version and delete marker first.
+- `adopt()` / `release()` bring resources created by the console, Terraform, or another script
+  into the same inventory — so the audit and the teardown cover them too. This is something a
+  state file cannot do.
+- `@auditor` and `@deleter` register checks and deleters for further resource types.
+
+### `wait=` on every slow creator
+
+`create_postgres`, `create_redis`, `create_instance`, `create_eks`, `create_opensearch`,
+`create_distribution`, `request_cert`, `build_image_in_codebuild`, and `GenAIStack.provision` now
+take `wait=`. `build_image_in_codebuild(wait=True)` raises on a failed build rather than returning
+a record that looks like success.
+
+Two building blocks in `core`: `wait_for` wraps a boto3 waiter with a ceiling generous enough for
+EKS and RDS (the `db_instance_available` default gives up too early), and `poll_until` covers
+OpenSearch, CodeBuild, and Cognito, which have no waiter at all.
+
+### Changed
+
+- `GenAIStack.provision` tags every resource it creates into the stack ledger.
+- `create_redis` no longer writes its AUTH token to Secrets Manager when the replication group
+  already existed — the token it would have stored was never given to ElastiCache.
+
 ## 0.1.0
 
 First release-shaped version. `awseasy` is now an enterprise GenAI provisioning library rather

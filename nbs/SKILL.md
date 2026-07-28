@@ -215,6 +215,67 @@ buildspec(auth, repo); ecr_push_policy(auth, repo)
 CodeBuild needs no local Docker. Repositories default to immutable tags, so pushing `latest`
 twice fails — `default_tag()` returns a sortable UTC timestamp instead.
 
+## ledger — inventory, audit, teardown
+
+No state file: every resource carries an `awseasy:stack` tag, and the Resource Groups Tagging API
+indexes tags account-wide, so AWS is the state store.
+
+```python
+ledger_tags('acme', {'env': 'prod'})   # {'env': 'prod', 'awseasy:stack': 'acme'} — pass as tags=
+parse_arn(arn)                         # {arn, partition, service, region, account, type, name}
+
+led = Ledger(auth, 'acme')             # or stack.ledger on a GenAIStack
+led.resources(services=['s3'])         # [{arn, service, type, name, tags}]
+led.arns(); led.by_service()
+led.adopt([arn, ...])                  # pull in resources created elsewhere; returns failures
+led.release([arn, ...])                # drop the stack tag; destroy() no longer touches them
+led.audit(failures_only=True)          # [{arn, name, check, ok, detail}]
+led.destroy(dry_run=True)              # {plan, deleted, unsupported, failed}
+led.destroy(dry_run=False)             # irreversible
+```
+
+Extend either registry with a decorator:
+
+```python
+@auditor('sqs', '')                    # (service, arn type) -> yields finding(r, check, ok, detail)
+def _audit_sqs(auth, r): ...
+
+@deleter('sqs', '', order=30)          # lower order runs first, so dependents go before deps
+def _rm_queue(auth, r): ...
+```
+
+Notes:
+
+- `destroy()` defaults to `dry_run=True`. `plan` is always populated; `deleted` only on a real run.
+- Anything with no registered deleter is listed under `unsupported`, never silently skipped.
+- One failed delete lands in `failed` and the rest of the teardown continues.
+- KMS keys are *scheduled* for deletion (7 days), not deleted — data encrypted with them stays
+  readable. S3 buckets are emptied (all versions and delete markers) first.
+- Auditors cover only controls that are wrong under any policy — public, unencrypted, no backups,
+  mutable tags. Profile choices (deletion protection, multi-AZ) are not reported as failures.
+- Unknown resource types report as `<service>:unchecked`, never as passing.
+- The tagging API is eventually consistent and does not index every service (IAM roles and
+  CloudFront distributions are absent).
+
+## wait= on slow resources
+
+Calls return as soon as AWS accepts the request. Pass `wait=True` to block until usable:
+
+```python
+create_postgres(auth, name, wait=True)                  # db_instance_available
+create_redis(auth, name, wait=True)                     # replication_group_available
+create_instance(auth, name, wait=True)                  # instance_running
+create_eks(auth, name, subnets, wait=True)              # cluster_active + nodegroup_active
+create_opensearch(auth, name, wait=True)                # polled: no boto3 waiter
+create_distribution(auth, name, ..., wait=True)         # distribution_deployed
+request_cert(auth, domain, wait=True)                   # needs the DNS records published first
+build_image_in_codebuild(auth, project, wait=True)      # raises RuntimeError on a failed build
+GenAIStack(...).provision(wait=True)
+```
+
+Building blocks in `core`: `wait_for(client, waiter_name, **kw)` raises the boto3 attempt ceiling
+to ~30 minutes; `poll_until(fn, ready, delay, timeout, desc)` covers services with no waiter.
+
 ## Conventions
 
 - Idempotent: re-running a `create_*` reconciles rather than duplicating.
@@ -222,3 +283,5 @@ twice fails — `default_tag()` returns a sortable UTC timestamp instead.
 - Secrets go to Secrets Manager and are never returned in a resource dict.
 - Roles only — no IAM users, no long-lived access keys.
 - Regional pinning is automatic where AWS demands it (ACM/WAF/CloudFront in us-east-1).
+- Everything `GenAIStack` provisions is tagged into its ledger, so inventory, audit, and teardown
+  need no extra bookkeeping.
